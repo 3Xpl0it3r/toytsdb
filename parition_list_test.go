@@ -6,6 +6,13 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+type fakePartition struct {
+	minT int64
+	maxT int64
+}
+
+var _ partition = new(fakePartition)
+
 func Test_partitionList_Remove(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -413,4 +420,39 @@ func Test_partitionList_Swap(t *testing.T) {
 			assert.Equal(t, tt.wantPartitionList, tt.partitionList)
 		})
 	}
+}
+
+
+
+
+func (f fakePartition) insertRows(rows []Row) (outdatedRows []Row, err error) {
+	return nil, nil
+}
+
+func (f fakePartition) selectDataPoints(labels Labels, start, end int64) ([]*Sample, error) {
+	return nil, nil
+}
+
+func (f fakePartition) minTimestamp() int64 {
+	return f.minT
+}
+
+func (f fakePartition) maxTimestamp() int64 {
+	return f.maxT
+}
+
+func (f fakePartition) size() int {
+	return 0
+}
+
+func (f fakePartition) active() bool {
+	return true
+}
+
+func (f fakePartition) clean() error {
+	return nil
+}
+
+func (f fakePartition) expired() bool {
+	return true
 }

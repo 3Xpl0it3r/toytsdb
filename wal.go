@@ -87,7 +87,7 @@ func (d *diskWal) append(op walOperation, rows []Row) error {
 			if err := d.w.WriteByte(byte(op)); err != nil {
 				return fmt.Errorf("failed to write operation %w\n", err)
 			}
-			name := marshalMetricName(row.Metric, row.Labels)
+			name := strconv.Itoa(int(row.Labels.Hash()))
 			lBuf := make([]byte, binary.MaxVarintLen64)
 			n := binary.PutUvarint(lBuf, uint64(len(name)))
 			if _, err := d.w.Write(lBuf[:n]); err != nil {
@@ -238,11 +238,11 @@ func newDiskWALReader(dir string) (*diskWALReader, error) {
 func (f *diskWALReader) readAll() error {
 	for _, file := range f.files {
 		if file.IsDir() {
-			return fmt.Errorf("unexpected directory found under the wal directory %w", file.Name())
+			return fmt.Errorf("unexpected directory found under the wal directory %s", file.Name())
 		}
 		fd, err := os.Open(filepath.Join(f.dir, file.Name()))
 		if err != nil {
-			return fmt.Errorf("failed to open wal segment files %w", err)
+			return fmt.Errorf("failed to open wal segment files %s", err)
 		}
 		segment := &segment{
 			file: fd,
@@ -308,7 +308,6 @@ func (f *segment) next() bool {
 		f.current = walRecord{
 			op: walOperation(op),
 			row: Row{
-				Metric: string(metrics),
 				Sample: Sample{
 					Value:     math.Float64frombits(val),
 					Timestamp: ts,

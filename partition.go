@@ -14,7 +14,7 @@ type partition interface {
 	insertRows(rows []Row)(outdatedRows []Row,err error)
 	// Read operations
 	// selectDataPoints gives back certain metrics data points within the give range
-	selectDataPoints(metrics string, labels []Label, start, end int64)([]*Sample, error)
+	selectDataPoints(labels Labels, start, end int64)([]*Sample, error)
 	// minTimestamp return the minimum Unix timestamp in milliseconds
 	minTimestamp()int64
 	// maxTimestamp return the maximum Unix timestamp in milliseconds

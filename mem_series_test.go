@@ -6,100 +6,104 @@ import (
 	"time"
 )
 
+var (
+	mockRow1 = Row{Labels: []Label{{Name: "__name__", Value: "metric1"}}, Sample: Sample{Timestamp: 1, Value: 0.1}}
+	mockRow2 = Row{Labels: []Label{{Name: "__name__", Value: "metric1"}}, Sample: Sample{Timestamp: 2, Value: 0.1}}
+	mockRow3 = Row{Labels: []Label{{Name: "__name__", Value: "metric1"}}, Sample: Sample{Timestamp: 3, Value: 0.1}}
+	mockRow4 = Row{Labels: []Label{{Name: "__name__", Value: "metric1"}}, Sample: Sample{Timestamp: 4, Value: 0.1}}
+
+)
+
 func Test_memoryPartition_InsertRows(t *testing.T) {
 	tests := []struct {
 		name               string
-		memoryPartition    *MemSeries
+		memoryPartition    *MemPartition
 		rows               []Row
 		wantErr            bool
 		wantDatePoints     []*Sample
 		wantOutOfOrderRows []Row
 	}{
 		{
-			name: "inset in-order rows",
-			memoryPartition: newMemoryPartition(nil, 0, "").(*MemSeries),
-			rows: []Row{
-				{Metric: "metric1", Sample: Sample{Timestamp:1, Value: 0.1}},
-				{Metric: "metric1", Sample: Sample{Timestamp:2, Value: 0.1}},
-				{Metric: "metric1", Sample: Sample{Timestamp:3, Value: 0.1}},
-			},
+			name:            "inset in-order rows",
+			memoryPartition: newMemoryPartition(nil, 0, "").(*MemPartition),
+			rows: []Row{mockRow1, mockRow2, mockRow3, mockRow4},
 			wantDatePoints: []*Sample{
 				{Timestamp: 1, Value: 0.1},
 				{Timestamp: 2, Value: 0.1},
 				{Timestamp: 3, Value: 0.1},
+				{Timestamp: 4, Value: 0.1},
 			},
 			wantOutOfOrderRows: []Row{},
 		},
 		{
 			name: "insert out-of-order rows",
-			memoryPartition: func() *MemSeries {
-				m := newMemoryPartition(nil, 0, "").(*MemSeries)
+			memoryPartition: func() *MemPartition {
+				m := newMemoryPartition(nil, 0, "").(*MemPartition)
 				m.insertRows([]Row{
-					{Metric: "metric1", Sample: Sample{Timestamp: 2, Value: 0.1}},
+					{Labels:
+					[]Label{{Name: "__name__", Value: "metric1"}},
+						Sample: Sample{Timestamp: 3, Value: 0.1},
+					},
 				})
 				return m
 			}(),
 			rows: []Row{
-				{Metric: "metric1", Sample: Sample{Timestamp: 1, Value: 0.1}},
+				{Labels:
+				[]Label{{Name: "__name__", Value: "metric1"}},
+					Sample: Sample{Timestamp: 1, Value: 0.1},
+				},
 			},
 			wantDatePoints: []*Sample{
-				{Timestamp: 2, Value: 0.1},
+				{Timestamp: 3, Value: 0.1},
 			},
 			wantOutOfOrderRows: []Row{
-				{Metric: "metric1", Sample: Sample{Timestamp: 1, Value: 0.1}},
+				{Labels:
+				[]Label{{Name: "__name__", Value: "metric1"}},
+					Sample: Sample{Timestamp: 1, Value: 0.1},
+				},
 			},
 		},
 	}
-	for _, tt := range tests{
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gotOutOfOrder, err := tt.memoryPartition.insertRows(tt.rows)
-			assert.Equal(t, tt.wantErr, err!= nil)
+			assert.Equal(t, tt.wantErr, err != nil)
 			assert.Equal(t, tt.wantOutOfOrderRows, gotOutOfOrder)
+			labels := Labels{
+				{Name: "__name__", Value: "metric1"},
+			}
 
-			got, _ := tt.memoryPartition.selectDataPoints("metric1", nil, 0, 4)
+			got, _ := tt.memoryPartition.selectDataPoints(labels, 0, 4)
 			assert.Equal(t, tt.wantDatePoints, got)
 		})
 	}
 }
 
 func Test_memoryPartition_SelectDataPoints(t *testing.T) {
-	tests := []struct{
-		name string
-		metric string
-		labels []Label
-		start int64
-		end int64
-		memoryPartition *MemSeries
-		want []*Sample
+	tests := []struct {
+		name            string
+		labels          []Label
+		start           int64
+		end             int64
+		memoryPartition *MemPartition
+		want            []*Sample
 	}{
 		{
-			name: "given non-exist metric name",
-			metric: "unknown",
-			start : 1,
-			end: 2,
-			memoryPartition: newMemoryPartition(nil, 0, "").(*MemSeries),
-			want: []*Sample{},
+			name:            "given non-exist metric name",
+			start:           1,
+			end:             2,
+			memoryPartition: newMemoryPartition(nil, 0, "").(*MemPartition),
+			want:            []*Sample{},
 		},
 		{
-			name: "select multiple points",
-			metric: "metric1",
-			start: 1,
-			end: 4,
-			memoryPartition: func() *MemSeries{
-				m := newMemoryPartition(nil,0, "").(*MemSeries)
+			name:   "select multiple points",
+			labels: []Label{{Name: "__name__", Value: "metric1"}},
+			start:  0,
+			end:    4,
+			memoryPartition: func() *MemPartition {
+				m := newMemoryPartition(nil, 0, "").(*MemPartition)
 				m.insertRows([]Row{
-					{
-						Metric: "metric1",
-						Sample: Sample{Timestamp: 1, Value: 0.1},
-					},
-					{
-						Metric: "metric1",
-						Sample: Sample{Timestamp: 2, Value: 0.1},
-					},
-					{
-						Metric: "metric1",
-						Sample: Sample{Timestamp: 3, Value: 0.1},
-					},
+					mockRow1,mockRow2,mockRow3,
 				})
 				return m
 			}(),
@@ -117,9 +121,9 @@ func Test_memoryPartition_SelectDataPoints(t *testing.T) {
 		},
 	}
 
-	for _,tt := range tests{
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, _ := tt.memoryPartition.selectDataPoints(tt.metric, tt.labels, tt.start, tt.end)
+			got, _ := tt.memoryPartition.selectDataPoints(tt.labels, tt.start, tt.end)
 			assert.Equal(t, tt.want, got)
 		})
 	}

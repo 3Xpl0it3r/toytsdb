@@ -1,7 +1,6 @@
 package toytsdb
 
 import (
-	"fmt"
 	"github.com/stretchr/testify/assert"
 	"testing"
 	"time"
@@ -31,7 +30,6 @@ func TestOpenDiskPartition(t *testing.T){
 	for _, tt := range tests{
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := openDiskPartition(tt.dirPath, tt.retention)
-			fmt.Printf("Debug %v| Err: %v\n", got, err)
 			assert.Equal(t, tt.wantErr, err != nil)
 			assert.Equal(t, tt.want,got)
 		})

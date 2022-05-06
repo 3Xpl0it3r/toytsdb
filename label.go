@@ -46,6 +46,14 @@ func(ls Labels)Hash()uint64{
 }
 
 
+func(ls Labels)Empty()bool{
+	if len(ls) == 0{
+		return true
+	}
+	return false
+}
+
+
 func(ls Labels)Equals(o Labels)bool{
 	if len(ls) != len(o) {
 		return false
@@ -56,8 +64,4 @@ func(ls Labels)Equals(o Labels)bool{
 		}
 	}
 	return true
-}
-
-func marshalMetricName(metric string, ls Labels)string{
-	return metric + ls.String()
 }

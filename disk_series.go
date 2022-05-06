@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -97,12 +98,12 @@ func (d DiskPartition) insertRows(rows []Row) (outdatedRows []Row, err error) {
 	return nil, fmt.Errorf("cannot insert rows to disk")
 }
 
-func (d DiskPartition) selectDataPoints(metrics string, labels []Label, start, end int64) ([]*Sample, error) {
+func (d DiskPartition) selectDataPoints(labels Labels, start, end int64) ([]*Sample, error) {
 	if d.expired(){
 		return nil, fmt.Errorf("this disk partition has expired")
 	}
-	name := marshalMetricName(metrics, labels)
-	mt,ok := d.meta.Metrics[name]
+	name := labels.Hash()
+	mt,ok := d.meta.Metrics[strconv.Itoa(int(name))]
 	if !ok {
 		return nil, fmt.Errorf("NoDataPoint")
 	}

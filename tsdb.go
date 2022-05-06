@@ -48,14 +48,12 @@ type Storage interface {
 
 // Reader provides reading access of time serial data
 type Reader interface {
-	Select(metrics string, labels []Label, start, end int64) (points []*Sample, err error)
+	Select(labels Labels, start, end int64) ([]*Sample, error)
 }
 
 type Row struct {
-	// the uniq name of metrics
-	Metric string
 	// An Optional key-value properties of futhres detailed identification
-	Labels []Label
+	Labels Labels
 	Sample
 }
 
@@ -90,7 +88,7 @@ type TSBD struct {
 
 func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 	if err := os.MkdirAll(dir, fs.ModePerm); err != nil && !errors.Is(os.ErrExist, err) {
-		return nil, fmt.Errorf("create db directory failed: %db", err.Error())
+		return nil, fmt.Errorf("create db directory failed: %s", err.Error())
 	}
 	db := &TSBD{
 		partitionList:      newPartitionList(),
@@ -113,7 +111,7 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 		return db, nil
 	}
 	if err := os.Mkdir(db.dataPath, fs.ModePerm); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("failed to make data directory %db: %w", db.dataPath, err)
+		return nil, fmt.Errorf("failed to make data directory %v: %w", db.dataPath, err)
 	}
 
 	// write ahead log
@@ -147,7 +145,7 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 		path := filepath.Join(db.dataPath, e.Name())
 		part, err := openDiskPartition(path, db.retention)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open disk partition  for %db: %w", path, err)
+			return nil, fmt.Errorf("failed to open disk partition  for %s: %w", path, err)
 		}
 		partitions = append(partitions, part)
 	}
@@ -209,10 +207,9 @@ func (db *TSBD) ensureActiveHead() error {
 	return nil
 }
 
-func (db *TSBD) Select(metric string, labels []Label, start, end int64) ([]*Sample, error) {
-	//todo
-	if metric == "" {
-		return nil, fmt.Errorf("metric must be set")
+func (db *TSBD) Select(labels Labels, start, end int64) ([]*Sample, error) {
+	if labels.Empty(){
+		return nil, fmt.Errorf("labels is empty")
 	}
 	if start >= end {
 		return nil, fmt.Errorf("the given start it greater than the end")
@@ -230,7 +227,7 @@ func (db *TSBD) Select(metric string, labels []Label, start, end int64) ([]*Samp
 		if curPartition.value().minTimestamp() > end {
 			continue
 		}
-		ps, err := curPartition.value().selectDataPoints(metric, labels, start, end)
+		ps, err := curPartition.value().selectDataPoints(labels, start, end)
 		if err != nil {
 			return nil, fmt.Errorf("failed to select data points : %w", err)
 		}
@@ -282,7 +279,7 @@ func (db *TSBD) flushPartitions() error {
 			curNode = curNode.getNext()
 			continue
 		}
-		memPart, ok := curNode.value().(*MemSeries)
+		memPart, ok := curNode.value().(*MemPartition)
 		if !ok {
 			curNode = curNode.getNext()
 			continue
@@ -297,11 +294,11 @@ func (db *TSBD) flushPartitions() error {
 
 		dir := filepath.Join(db.dataPath, fmt.Sprintf("p-%d-%d", memPart.minTimestamp(), memPart.maxTimestamp()))
 		if err := db.flush(dir, memPart); err != nil {
-			return fmt.Errorf("failed to compact memory parition into %db: %w", dir, err)
+			return fmt.Errorf("failed to compact memory parition into %s: %w", dir, err)
 		}
 		newPart, err := openDiskPartition(dir, db.retention)
 		if err != nil {
-			return fmt.Errorf("failed to generate disk partition for %db ; %w", dir, err)
+			return fmt.Errorf("failed to generate disk partition for %s ; %w", dir, err)
 		}
 		if err := db.partitionList.swap(curNode.value(), newPart); err != nil {
 			return fmt.Errorf("failed to swap partition : %w ", err)
@@ -327,7 +324,7 @@ func (db *TSBD) newPartition(p partition, punctuateWAL bool) error {
 }
 
 // flush compacts the data points in the give partition and flushes them to the given directory
-func (db *TSBD) flush(dirPath string, m *MemSeries) error {
+func (db *TSBD) flush(dirPath string, m *MemPartition) error {
 	if dirPath == "" {
 		return fmt.Errorf("dir path is requierd ")
 	}
@@ -386,7 +383,7 @@ func (db *TSBD) flush(dirPath string, m *MemSeries) error {
 	}
 	metaPath := filepath.Join(dirPath, metaFileName)
 	if err := os.WriteFile(metaPath, b, fs.ModePerm); err != nil {
-		return fmt.Errorf("failed to write metadata to %db: %w", metaPath, err)
+		return fmt.Errorf("failed to write metadata to %s: %w", metaPath, err)
 	}
 	return nil
 }

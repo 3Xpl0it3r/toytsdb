@@ -12,11 +12,21 @@ func main(){
 	}
 	_ = s.InsertRows([]toytsdb.Row{
 		{
-			Metric: "metric1",
+			Labels: []toytsdb.Label{
+				{
+					Name: "__name__",
+					Value: "metric1",
+				},
+			},
 			Sample: toytsdb.Sample{Timestamp: 1600000000, Value: 0.1},
 		},
 	})
-	points, _ := s.Select("metric1", nil, 1600000000, 1600000001)
+	labels := toytsdb.Labels{
+		{
+			Name: "__name__", Value: "metric1",
+		},
+	}
+	points, _ := s.Select(labels, 1600000000, 1600000001)
 	for _, p := range points {
 		fmt.Printf("timestamp: %v, value: %v\n", p.Timestamp, p.Value)
 		// => timestamp: 1600000000, value: 0.1

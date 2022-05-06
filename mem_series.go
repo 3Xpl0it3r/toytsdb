@@ -4,14 +4,15 @@ import (
 	"fmt"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-var _ partition = new(MemSeries)
+var _ partition = new(MemPartition)
 
-type MemSeries struct {
+type MemPartition struct {
 	metrics sync.Map
 	numPoints int64
 
@@ -44,7 +45,7 @@ func newMemoryPartition(wal Wal, partitionDuration time.Duration, precision Time
 	default:
 		d = partitionDuration.Nanoseconds()
 	}
-	return &MemSeries{
+	return &MemPartition{
 		partitionDuration:  d,
 		timestampPrecision: precision,
 		wal: wal,
@@ -52,7 +53,7 @@ func newMemoryPartition(wal Wal, partitionDuration time.Duration, precision Time
 }
 
 
-func (m *MemSeries) insertRows(rows []Row) ( []Row,  error) {
+func (m *MemPartition) insertRows(rows []Row) ( []Row,  error) {
 	if len(rows) == 0{
 		return nil, fmt.Errorf("no rows given ")
 	}
@@ -87,8 +88,8 @@ func (m *MemSeries) insertRows(rows []Row) ( []Row,  error) {
 		if row.Timestamp > maxTimestamp{
 			m.maxT = row.Timestamp
 		}
-		name := marshalMetricName(row.Metric, row.Labels)
-		mt := m.getMetric(name)
+		name := row.Labels.Hash()
+		mt := m.getMetric(strconv.Itoa(int(name)))
 		mt.insertPoint(&row.Sample)
 		rowsNum ++
 	}
@@ -101,29 +102,29 @@ func (m *MemSeries) insertRows(rows []Row) ( []Row,  error) {
 	return outdatedRows, nil
 }
 
-func (m *MemSeries) selectDataPoints(metrics string, labels []Label, start, end int64) ([]*Sample, error) {
-	name := marshalMetricName(metrics, labels)
-	mt := m.getMetric(name)
+func (m *MemPartition) selectDataPoints(labels Labels, start, end int64) ([]*Sample, error) {
+	name := labels.Hash()
+	mt := m.getMetric(strconv.Itoa(int(name)))
 	return mt.selectPoints(start, end), nil
 }
 
-func (m *MemSeries) minTimestamp() int64 {
+func (m *MemPartition) minTimestamp() int64 {
 	return atomic.LoadInt64(&m.minT)
 }
 
-func (m *MemSeries) maxTimestamp() int64 {
+func (m *MemPartition) maxTimestamp() int64 {
 	return atomic.LoadInt64(&m.maxT)
 }
 
-func (m *MemSeries) size() int {
+func (m *MemPartition) size() int {
 	return int(atomic.LoadInt64(&m.numPoints))
 }
 
-func (m *MemSeries) active() bool {
+func (m *MemPartition) active() bool {
 	return m.maxTimestamp() - m.minTimestamp() + 1 < m.partitionDuration
 }
 
-func(m *MemSeries)getMetric(name string)*memoryMetric{
+func(m *MemPartition)getMetric(name string)*memoryMetric{
 	// 使用并发map来实现， prometheues 里面采用了分片锁来提高并发行
 	// todo 更换成分片锁
 	value,ok := m.metrics.Load(name)
@@ -138,12 +139,12 @@ func(m *MemSeries)getMetric(name string)*memoryMetric{
 	return value.(*memoryMetric)
 }
 
-func(m *MemSeries)clean()error{
+func(m *MemPartition)clean()error{
 	runtime.GC()
 	return nil
 }
 
-func (f *MemSeries) expired() bool {
+func (f *MemPartition) expired() bool {
 	return false
 }
 

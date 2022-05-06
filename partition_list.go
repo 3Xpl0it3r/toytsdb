@@ -122,7 +122,7 @@ func (p *partitionListImpl)String()string{
 	var cur *partitionNode
 	for cur = p.head; cur!= nil ; cur = cur.getNext(){
 		switch cur.value().(type) {
-		case *MemSeries:
+		case *MemPartition:
 			b.WriteString("[Memory Partition]")
 		case *DiskPartition:
 			b.WriteString("[Disk partition]")
