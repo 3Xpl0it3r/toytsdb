@@ -6,7 +6,7 @@ package toytsdb
 import "io"
 
 // bstream is a stream of bits
-type bstream struct {
+type bStream struct {
 	// the data stream
 	stream []byte
 
@@ -14,22 +14,22 @@ type bstream struct {
 	count uint8
 }
 
-func newBReader(b []byte)*bstream {
-	return &bstream{stream: b, count: 8}
+func newBReader(b []byte)*bStream {
+	return &bStream{stream: b, count: 8}
 }
 
-func newBWriter(size int) bstream {
-	return bstream{stream: make([]byte,0, size)}
+func newBWriter(size int) bStream {
+	return bStream{stream: make([]byte,0, size), count: 0}
 }
 
 
-func(b *bstream)clone()*bstream {
+func(b *bStream)clone()*bStream {
 	d := make([]byte, len(b.stream))
 	copy(d, b.stream)
-	return &bstream{stream: d, count: b.count}
+	return &bStream{stream: d, count: b.count}
 }
 
-func(b *bstream)bytes()[]byte{
+func(b *bStream)bytes()[]byte{
 	return b.stream
 }
 
@@ -44,7 +44,7 @@ const (
 // [0 0 0 0 0 0 0 0]
 // <----------------写入方向
 // writeBit write a bit into bstream, from hight address to low address
-func(b *bstream)writeBit(bit bit){
+func(b *bStream)writeBit(bit bit){
 	if b.count == 0{
 		//当前字节里面没有剩余的bit可供写入，追加一个字节
 		b.stream = append(b.stream, 0)
@@ -58,8 +58,8 @@ func(b *bstream)writeBit(bit bit){
 }
 
 // 往bstream里面写入一个字节
-// writeByte write a byte into bstream
-func(b *bstream)writeByte(byt byte){
+// writeByte write a byte into bStream
+func(b *bStream)writeByte(byt byte){
 	if b.count == 0{
 		b.stream = append(b.stream, 0)
 		b.count = 8
@@ -76,7 +76,7 @@ func(b *bstream)writeByte(byt byte){
 
 
 // writeBits 将u 的低nbits位写入到bstream里面
-func(b *bstream)writeBits(u uint64, nbits int){
+func(b *bStream)writeBits(u uint64, nbits int){
 	// 保留低nbits位(这个是需要写入到bstram里面的)
 	u <<= (64-uint(nbits))
 	for nbits >= 8{
@@ -101,7 +101,7 @@ func(b *bstream)writeBits(u uint64, nbits int){
 [2 3 4 5 6 7 8 0]
 一个位只能是0/1 这里用十进制表示为了说明读取顺序
  */
-func (b *bstream)readBit()(bit, error){
+func (b *bStream)readBit()(bit, error){
 	if len(b.stream) == 0{
 		return false, io.EOF
 	}
@@ -120,7 +120,7 @@ func (b *bstream)readBit()(bit, error){
 	return d != 0, nil
 }
 
-func(b *bstream)readByte()(byte , error){
+func(b *bStream)readByte()(byte , error){
 	if len(b.stream) == 0{
 		return 0, io.EOF
 	}
@@ -143,28 +143,28 @@ func(b *bstream)readByte()(byte , error){
 	// 将b.stream[0]里面的高8-count位写如到byt的低8-count位里面
 	byt |= b.stream[0] >> b.count
 	// 将读取完的位清0
-	b.stream[0] <<= (8-b.count)
+	b.stream[0] <<= 8-b.count
 	return byt, nil
 }
 
 
-func(b *bstream)readBits(nbits int)(uint64, error){
+func(b *bStream)readBits(nBits int)(uint64, error){
 	// 写入U从低到高写
 	var u uint64
-	for nbits >= 8{
+	for nBits >= 8{
 		byt ,err := b.readByte()
 		if err != nil{
 			return 0, err
 		}
 		u = (u<<8)|uint64(byt)
-		nbits -= 8
+		nBits -= 8
 	}
-	if nbits == 0{
+	if nBits == 0{
 		return u, nil
 	}
-	if nbits > int(b.count){
+	if nBits > int(b.count){
 		u = (u << uint(b.count)) | uint64(b.stream[0] >> (8-b.count))
-		nbits -= int(b.count)
+		nBits -= int(b.count)
 		b.stream = b.stream[1:]
 		if len(b.stream) == 0{
 			return 0, io.EOF
@@ -172,13 +172,13 @@ func(b *bstream)readBits(nbits int)(uint64, error){
 		b.count = 8
 	}
 
-	u = (u << uint(nbits)) | uint64(b.stream[0] >> (8-uint(nbits)))
-	b.stream[0] <<= uint(nbits)
-	b.count -= uint8(nbits)
+	u = (u << uint(nBits)) | uint64(b.stream[0] >> (8-uint(nBits)))
+	b.stream[0] <<= uint(nBits)
+	b.count -= uint8(nBits)
 	return u, nil
 }
 
-func(b *bstream)reset(){
+func(b *bStream)reset(){
 	b.stream = b.stream[:0]
 	b.count = 0
 }

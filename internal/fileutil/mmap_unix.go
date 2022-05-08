@@ -1,4 +1,5 @@
-package toytsdb
+// +build !windows,!plan9
+package fileutil
 
 import "syscall"
 

@@ -22,7 +22,7 @@ Compressing values
 		[ 0 0 1 1 1 1 0 0 ] < [0 1 1 1 1 1 0 ]
 			current					previous
 	b) Controller bit is 1, store and length of the number of leading zeros in the next 5 bits,and then store
-	   the lenght of the meaningful xored value in the next 6 bits. Finally store the meanningful bit of the xored value
+	   the length of the meaningful xorEd value in the next 6 bits. Finally store the meaningful bit of the xorEd value
 */
 package toytsdb
 
@@ -35,29 +35,28 @@ import (
 	"time"
 )
 
-type seriesEncoder interface {
-	encodePoint(sample *Sample)error
-	flush()error
-}
+//type seriesEncoder interface {
+//	encodePoint(t int64, v float64) error
+//	flush() error
+//}
+//
+//type seriesDecoder interface {
+//	Iterator() error
+//	Value()(int64, float64)
+//}
 
 
-type seriesDecoder interface {
-	decodePoint(dst *Sample)error
-}
-
-
-
-type gorillaEncoder struct {
+type XORChunk struct {
 	// backend stream writer
 	w io.Writer
 
 	sync.Mutex
 
-	T0  uint32
-	t   uint32
+	T0  int64
+	t   int64
 	val float64
 
-	bw       bstream
+	bw       bStream
 	leading  uint8
 	trailing uint8
 	finished bool
@@ -65,89 +64,87 @@ type gorillaEncoder struct {
 	tDelta uint32
 }
 
-func newSeriesEncoder(w io.Writer) *gorillaEncoder {
-	t0 := uint32(time.Now().Unix())
-	s := gorillaEncoder{
-		T0:      t0,
+func NewXorChunk(writer io.Writer) *XORChunk {
+	s := XORChunk{
+		T0:      time.Now().Unix(),
 		leading: ^uint8(0),
-		w: w,
+		w: writer,
 	}
-	s.bw.writeBits(uint64(t0), 32)
+	s.bw.writeBits(uint64(s.T0), 64)
 
 	return &s
 }
 
 // Bytes value of the series stream
-func (s *gorillaEncoder) Bytes() []byte {
-	s.Lock()
-	defer s.Unlock()
-	return s.bw.bytes()
+func (e *XORChunk) Bytes() []byte {
+	e.Lock()
+	defer e.Unlock()
+	return e.bw.bytes()
 }
 
-func finish(w *bstream) {
+func finish(w *bStream) {
 	// write an end-of-stream record
 	w.writeBits(0x0f, 4)
 	w.writeBits(0xffffffff, 32)
 	w.writeBit(zero)
 }
 
-func (s *gorillaEncoder) Finish() {
-	s.Lock()
-	defer s.Unlock()
-	if !s.finished {
-		finish(&s.bw)
-		s.finished = true
+func (e *XORChunk) Finish() {
+	e.Lock()
+	defer e.Unlock()
+	if !e.finished {
+		finish(&e.bw)
+		e.finished = true
 	}
 }
 
 // Put a timestamp and value to the series
-func (s *gorillaEncoder) encodePoint(sample *Sample) error{
+func (e *XORChunk) Append(t int64, v float64) error {
 	// t uint32, v float64
-	t := uint32(sample.Timestamp)
-	v := float64(sample.Value)
-	s.Lock()
-	defer s.Unlock()
-	if s.t == 0 {
+	e.Lock()
+	defer e.Unlock()
+	if e.t == 0 {
 		// the first time stamp t0 in block is stored as a delta from t-1 in 14 bits
-		s.t = t
-		s.val = v
-		s.tDelta = t - s.T0
-		s.bw.writeBits(uint64(s.tDelta), 14)
-		s.bw.writeBits(math.Float64bits(v), 64)
+		e.t = t
+		e.val = v
+		e.tDelta = uint32(t - e.T0)
+
+		e.bw.writeBits(uint64(e.tDelta), 32)
+		e.bw.writeBits(math.Float64bits(v), 64)
 		return nil
 	}
 	// compression time stamps
-	tDelta := t - s.t               // delta
-	dod := int32(tDelta - s.tDelta) // delta of delta
+	tDelta :=uint32(t - e.t )            // delta
+	dod := int32(tDelta - e.tDelta) // delta of delta
 	switch {
 	case dod == 0:
 		// if D is zero, the store a single '0' bit
-		s.bw.writeBit(zero)
+		e.bw.writeBit(zero)
 	case -63 <= dod && dod <= 64:
 		// if D is between [-63, 64], store '10' followed by the value(7bit)
-		s.bw.writeBits(0x02, 2)
-		s.bw.writeBits(uint64(dod), 7)
+		e.bw.writeBits(0x02, 2)
+		e.bw.writeBits(uint64(dod), 7)
 	case -255 <= dod && dod <= 256:
 		// if D is between [-255, 256], store '110' followed by the value(9bit)
-		s.bw.writeBits(0x06, 3)
-		s.bw.writeBits(uint64(dod), 9)
+		e.bw.writeBits(0x06, 3)
+		e.bw.writeBits(uint64(dod), 9)
 	case -2047 <= dod && dod <= 2047:
 		// if D is between [-2047, 2048], store '1110' followed by value(12 bit)
-		s.bw.writeBits(0x0e, 4)
-		s.bw.writeBits(uint64(dod), 12)
+		e.bw.writeBits(0x0e, 4)
+		e.bw.writeBits(uint64(dod), 12)
 	default:
 		// otherwise store '1111' followed by D using 32 bits
-		s.bw.writeBits(0x0f, 4)
-		s.bw.writeBits(uint64(dod), 32)
+		e.bw.writeBits(0x0f, 4)
+		e.bw.writeBits(uint64(dod), 32)
 	}
 	// compression values
-	vDelta := math.Float64bits(v) ^ math.Float64bits(s.val)
+	vDelta := math.Float64bits(v) ^ math.Float64bits(e.val)
 	if vDelta == 0 {
 		// if xor with the previous is zero(means they are same value),store a single '0' bit
-		s.bw.writeBit(zero)
+		e.bw.writeBit(zero)
 	} else {
 		// if xor is not zero,calculate the number of leading and trailing zero in xor, store '1' bit
-		s.bw.writeBit(one)
+		e.bw.writeBit(one)
 
 		leading := uint8(bits.LeadingZeros64(vDelta))
 		trailing := uint8(bits.TrailingZeros64(vDelta))
@@ -155,36 +152,36 @@ func (s *gorillaEncoder) encodePoint(sample *Sample) error{
 		if leading >= 32 {
 			leading = 31
 		}
-		if s.leading != ^uint8(0) && leading >= s.leading && trailing >= s.trailing {
+		if e.leading != ^uint8(0) && leading >= e.leading && trailing >= e.trailing {
 			//
-			s.bw.writeBit(zero)
-			s.bw.writeBits(vDelta>>s.trailing, 64-int(s.leading)-int(s.trailing))
+			e.bw.writeBit(zero)
+			e.bw.writeBits(vDelta>>e.trailing, 64-int(e.leading)-int(e.trailing))
 		} else {
 			// Controller bit is 1, store and length of the number of leading zeros in the next 5 bits,and then store
-			//	the lenght of the meaningful xored value in the next 6 bits. Finally store the meanningful bit of the xored value
-			s.leading, s.trailing = leading, trailing
-			s.bw.writeBit(one)
-			s.bw.writeBits(uint64(leading), 5)
+			//	the length of the meaningful xorEd value in the next 6 bits. Finally store the meaningful bit of the xorEd value
+			e.leading, e.trailing = leading, trailing
+			e.bw.writeBit(one)
+			e.bw.writeBits(uint64(leading), 5)
 
-			sigbits := 64 - leading - trailing
-			s.bw.writeBits(uint64(sigbits), 6)
-			s.bw.writeBits(vDelta>>trailing, int(sigbits))
+			sigBits := 64 - leading - trailing
+			e.bw.writeBits(uint64(sigBits), 6)
+			e.bw.writeBits(vDelta>>trailing, int(sigBits))
 		}
 	}
-	s.tDelta = tDelta
-	s.t = t
-	s.val = v
+	e.tDelta = tDelta
+	e.t = t
+	e.val = v
 	return nil
 }
 
-func(e *gorillaEncoder)flush()error{
-	if _, err := e.w.Write(e.Bytes());err != nil{
+func (e *XORChunk) flush() error {
+	if _, err := e.w.Write(e.Bytes()); err != nil {
 		return fmt.Errorf("failed to flush bstream into files")
 	}
 	e.reset()
 	return nil
 }
-func(e *gorillaEncoder)reset(){
+func (e *XORChunk) reset() {
 	e.bw.reset()
 	e.T0 = 0
 	e.t = 0
@@ -194,76 +191,67 @@ func(e *gorillaEncoder)reset(){
 	e.trailing = 0
 }
 
-type gorillaDecoder struct {
-	T0 uint32
+type XORIterator struct {
+	T0 int64
 
-	t   uint32
+	t   int64
 	val float64
 
-	br       bstream
+	br       bStream
 	leading  uint8
 	trailing uint8
 
 	finished bool
 
-	tDelta uint32
+	tDelta int32
 
 	err error
 }
 
+func newIterator(r io.Reader) (*XORIterator, error) {
+	b, err := io.ReadAll(r)
 
-func bstreamIterator(br *bstream)(*gorillaDecoder, error){
-	br.count = 8
-	t0,err := br.readBits(32)
-	if err != nil{
-		return nil, err
-	}
-	return &gorillaDecoder{T0: uint32(t0), br: *br}, nil
-}
-
-
-func newSeriesDeocder(r io.Reader)(seriesDecoder, error){
-	//return bstreamIterator(newBReader(b))
-	b,err := io.ReadAll(r)
-	if err != nil{
+	if err != nil {
 		return nil, fmt.Errorf("read bytes from diskpartition failed: %w", err)
 	}
-	return bstreamIterator(newBReader(b))
+	br := newBReader(b)
+	t0, err := br.readBits(64)
+	if err != nil {
+		return nil, err
+	}
+	return &XORIterator{T0: int64(t0), br: *br}, nil
 }
 
-var _ seriesDecoder = new(gorillaDecoder)
 
 
-func(it *gorillaDecoder)decodePoint(dst *Sample) error {
-	if it.err != nil||it.finished{
+func (it *XORIterator) Next() error {
+	if it.err != nil || it.finished {
 		return io.EOF
 	}
 
-	if it.t == 0{
+	if it.t == 0 {
 		// read first timestamp and value
-		tDelta, err := it.br.readBits(14)
-		if err != nil{
+		tDelta, err := it.br.readBits(32)
+		if err != nil {
 			it.err = err
 			return err
 		}
-		it.tDelta = uint32(tDelta)
-		it.t = it.T0 + it.tDelta
+		it.tDelta = int32(tDelta)
+		it.t = it.T0 + int64(it.tDelta)
 		v, err := it.br.readBits(64)
-		if err != nil{
+		if err != nil {
 			it.err = err
-			return  err
+			return err
 		}
 		it.val = math.Float64frombits(v)
-		dst.Timestamp = int64(it.t)
-		dst.Value = it.val
 		return nil
 	}
 	// read dod
 	var d byte
-	for i := 0; i<4 ;i++{
+	for i := 0; i < 4; i++ {
 		d <<= 1
-		bit,err := it.br.readBit()
-		if err != nil{
+		bit, err := it.br.readBit()
+		if err != nil {
 			it.err = err
 			return err
 		}
@@ -285,42 +273,42 @@ func(it *gorillaDecoder)decodePoint(dst *Sample) error {
 		sz = 12
 	case 0x0f:
 		bits, err := it.br.readBits(32)
-		if err != nil{
+		if err != nil {
 			it.err = err
 			return err
 		}
-		if bits == 0xffffffff{
+		if bits == 0xffffffff {
 			it.finished = true
 			return err
 		}
 		dod = int32(bits)
 	}
-	if sz!= 0{
-		bits,err := it.br.readBits(int(sz))
-		if err != nil{
+	if sz != 0 {
+		bits, err := it.br.readBits(int(sz))
+		if err != nil {
 			it.err = err
 			return err
 		}
-		if bits > (1 << (sz-1)){
-			bits = bits - (1<<sz)
+		if bits > (1 << (sz - 1)) {
+			bits = bits - (1 << sz)
 		}
 		dod = int32(bits)
 	}
-	tDelta := it.tDelta + uint32(dod)
+	tDelta := it.tDelta + dod
 	it.tDelta = tDelta
-	it.t = it.t + it.tDelta
+	it.t = it.t + int64(it.tDelta)
 
 	// read compressed value
-	bit ,err := it.br.readBit()
-	if err != nil{
+	bit, err := it.br.readBit()
+	if err != nil {
 		it.err = err
 		return err
 	}
 	if bit == zero {
 		// it.val = it.val
-	}else {
-		controlBit,itErr := it.br.readBit()
-		if itErr != nil{
+	} else {
+		controlBit, itErr := it.br.readBit()
+		if itErr != nil {
 			it.err = err
 			return err
 		}
@@ -328,48 +316,45 @@ func(it *gorillaDecoder)decodePoint(dst *Sample) error {
 			// case a
 			// reuse leading/trailing zero bit
 			// it.leading, it.trailing = it.leading, it.trailing
-		}else {
+		} else {
 			// case b
-			bits,err := it.br.readBits(5)	// read the number of leading zero
-			if err != nil{
+			bits, err := it.br.readBits(5) // read the number of leading zero
+			if err != nil {
 				it.err = err
 				return err
 			}
 			it.leading = uint8(bits)
 
-			bits,err = it.br.readBits(6)	// read the number of significant
-			if err != nil{
+			bits, err = it.br.readBits(6) // read the number of significant
+			if err != nil {
 				it.err = err
 				return err
 			}
 			mbits := uint8(bits)
 			// 0 significant bits here means we overflow and we can actually need 64 ; see comment  it encoder
-			if mbits == 0{
+			if mbits == 0 {
 				mbits = 64
 			}
 			it.trailing = 64 - it.leading - mbits
 		}
-		mbits := int(64-it.leading - it.trailing)
-		xorBits,err := it.br.readBits(mbits)
-		if err != nil{
+		mbits := int(64 - it.leading - it.trailing)
+		xorBits, err := it.br.readBits(mbits)
+		if err != nil {
 			it.err = err
 			return err
 		}
-		vbits := math.Float64bits(it.val)
+		vBits := math.Float64bits(it.val)
 		// value0 ^ value1 = xor1  => xor1 ^ value0 = value1
-		vbits ^= (xorBits << it.trailing)
-		it.val = math.Float64frombits(vbits)
+		vBits ^= xorBits << it.trailing
+		it.val = math.Float64frombits(vBits)
 	}
-	dst.Timestamp = int64(it.t)
-	dst.Value = it.val
 	return nil
 }
 
-
-func(it *gorillaDecoder)Value()(uint32, float64){
+func (it *XORIterator) Value() (int64, float64) {
 	return it.t, it.val
 }
 
-func(it *gorillaDecoder)Err()error{
+func (it *XORIterator) Err() error {
 	return it.err
 }

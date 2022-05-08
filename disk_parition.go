@@ -1,13 +1,13 @@
-//
+// block is file disk partition
 package toytsdb
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/3Xpl0it3r/toytsdb/internal/fileutil"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 )
 
@@ -38,14 +38,18 @@ type BlockMeta struct {
 	MinTimestamp int64 `json:"minTimestamp"`
 	MaxTimestamp int64 `json:"maxTimestamp"`
 	NumDataPoints int `json:"numDataPoints"`
-	Metrics map[string]diskMetric `json:"metrics"`
+	Metrics map[uint64]diskMetric `json:"metrics"`
 	
 	CreateAt time.Time `json:"createAt"`
 }
 
+type Index struct {
+
+}
+
 
 type diskMetric struct {
-	Name string `json:"name"`
+	Name uint64 `json:"name"`
 	Offset int64 `json:"offset"`
 	MinTimestamp int64 `json:"min_timestamp"`
 	MaxTimestamp int64 `json:"max_timestamp"`
@@ -56,7 +60,8 @@ func openDiskPartition(dirPath string, retention time.Duration)(partition, error
 	if dirPath == ""{
 		return nil, fmt.Errorf("dir path is required")
 	}
-	f, err := os.Open(filepath.Join(dirPath, dataFileName))
+
+	f,err := fileutil.OpenFile(filepath.Join(dirPath, dataFileName))
 	if err != nil{
 		return nil, fmt.Errorf("failed to read data: %w",err)
 	}
@@ -68,13 +73,13 @@ func openDiskPartition(dirPath string, retention time.Duration)(partition, error
 	if info.Size() == 0{
 		return nil, fmt.Errorf("no data points")
 	}
-	mapped, err := Mmap(int(f.Fd()), int(info.Size()))
+	mapped, err := fileutil.Mmap(int(f.Fd()), int(info.Size()))
 	if err != nil{
 		return nil, fmt.Errorf("failed to perform mmap: %w", err)
 	}
 
 	m := BlockMeta{}
-	mf,err := os.Open(filepath.Join(dirPath, metaFileName))
+	mf,err := fileutil.OpenFile(filepath.Join(dirPath, metaFileName))
 	if err != nil{
 		return nil, fmt.Errorf("failed to read metadata :%w", err)
 	}
@@ -102,8 +107,7 @@ func (d DiskPartition) selectDataPoints(labels Labels, start, end int64) ([]*Sam
 	if d.expired(){
 		return nil, fmt.Errorf("this disk partition has expired")
 	}
-	name := labels.Hash()
-	mt,ok := d.meta.Metrics[strconv.Itoa(int(name))]
+	mt,ok := d.meta.Metrics[labels.Hash()]
 	if !ok {
 		return nil, fmt.Errorf("NoDataPoint")
 	}
@@ -113,7 +117,8 @@ func (d DiskPartition) selectDataPoints(labels Labels, start, end int64) ([]*Sam
 		return nil, fmt.Errorf("failed to seek: %w", err)
 	}
 
-	decoder, err := newSeriesDeocder(r)
+
+	decoder, err := newIterator(r)
 	if err !=nil{
 		return nil, fmt.Errorf("failed to generate decoder")
 	}
@@ -126,9 +131,11 @@ func (d DiskPartition) selectDataPoints(labels Labels, start, end int64) ([]*Sam
 	points := make([]*Sample, 0, mt.NumDataPoints)
 	for i := 0 ;i< int(mt.NumDataPoints);i++{
 		sample := &Sample{}
-		if err := decoder.decodePoint(sample);err !=nil{
-			return nil, fmt.Errorf("failed to decode point %w", err)
+		if err := decoder.Next();err != nil{
+			return nil, fmt.Errorf("faile to iterator")
 		}
+		sample.Timestamp, sample.Value = decoder.Value()
+
 		if sample.Timestamp < start{
 			continue
 		}

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"runtime"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,7 +69,7 @@ func (m *MemPartition) insertRows(rows []Row) ( []Row,  error) {
 				min = row.Timestamp
 			}
 		}
-		atomic.StoreInt64(&m.minT, min)
+		atomic.SwapInt64(&m.minT, min)
 	})
 	outdatedRows := make([]Row, 0)
 	maxTimestamp := rows[0].Timestamp
@@ -88,8 +87,7 @@ func (m *MemPartition) insertRows(rows []Row) ( []Row,  error) {
 		if row.Timestamp > maxTimestamp{
 			m.maxT = row.Timestamp
 		}
-		name := row.Labels.Hash()
-		mt := m.getMetric(strconv.Itoa(int(name)))
+		mt := m.getMetric(row.Labels.Hash())
 		mt.insertPoint(&row.Sample)
 		rowsNum ++
 	}
@@ -103,8 +101,7 @@ func (m *MemPartition) insertRows(rows []Row) ( []Row,  error) {
 }
 
 func (m *MemPartition) selectDataPoints(labels Labels, start, end int64) ([]*Sample, error) {
-	name := labels.Hash()
-	mt := m.getMetric(strconv.Itoa(int(name)))
+	mt := m.getMetric(labels.Hash())
 	return mt.selectPoints(start, end), nil
 }
 
@@ -124,7 +121,7 @@ func (m *MemPartition) active() bool {
 	return m.maxTimestamp() - m.minTimestamp() + 1 < m.partitionDuration
 }
 
-func(m *MemPartition)getMetric(name string)*memoryMetric{
+func(m *MemPartition)getMetric(name uint64)*memoryMetric{
 	// 使用并发map来实现， prometheues 里面采用了分片锁来提高并发行
 	// todo 更换成分片锁
 	value,ok := m.metrics.Load(name)
@@ -149,10 +146,10 @@ func (f *MemPartition) expired() bool {
 }
 
 type memoryMetric struct {
-	name string
+	name uint64
 	size int64
 	minTimestamp int64
-	maxTimestmap int64
+	maxTimestamp int64
 
 	points []*Sample
 	outOfOrderPoints []*Sample
@@ -167,7 +164,7 @@ func(m *memoryMetric)insertPoint(point *Sample){
 	if size == 0{
 		m.points = append(m.points, point)
 		atomic.StoreInt64(&m.minTimestamp, point.Timestamp)
-		atomic.StoreInt64(&m.maxTimestmap, point.Timestamp)
+		atomic.StoreInt64(&m.maxTimestamp, point.Timestamp)
 		atomic.AddInt64(&m.size, 1)
 		return
 	}
@@ -175,7 +172,7 @@ func(m *memoryMetric)insertPoint(point *Sample){
 	// Insert point in order
 	if m.points[size-1].Timestamp < point.Timestamp{
 		m.points = append(m.points, point)
-		atomic.StoreInt64(&m.maxTimestmap, point.Timestamp)
+		atomic.SwapInt64(&m.maxTimestamp, point.Timestamp)
 		atomic.AddInt64(&m.size, 1)
 		return
 	}
@@ -186,7 +183,7 @@ func(m *memoryMetric)insertPoint(point *Sample){
 func(m *memoryMetric)selectPoints(start, end int64)[]*Sample{
 	size := atomic.LoadInt64(&m.size)
 	minTimestamp := atomic.LoadInt64(&m.minTimestamp)
-	maxTimestamp := atomic.LoadInt64(&m.maxTimestmap)
+	maxTimestamp := atomic.LoadInt64(&m.maxTimestamp)
 	var startIdx, endIdx int
 	if end <= minTimestamp{
 		return []*Sample{}
@@ -228,33 +225,35 @@ func toUnix(t time.Time, precision TimestampPrecision)int64{
 }
 
 
-func(m *memoryMetric)encodeAllDataPoints(encoder seriesEncoder)error{
+func(m *memoryMetric)encodeAllDataPoints(encoder *XORChunk)error{
 	// merge sort
 	sort.Slice(m.outOfOrderPoints, func(i, j int) bool {
 		return m.outOfOrderPoints[i].Timestamp < m.outOfOrderPoints[j].Timestamp
 	})
 
 	var oi, pi int
+	var point *Sample
 	for oi < len(m.outOfOrderPoints) && pi < len(m.points){
 		if m.outOfOrderPoints[oi].Timestamp < m.points[pi].Timestamp{
-			if err := encoder.encodePoint(m.outOfOrderPoints[oi]);err !=nil{
-				return err
-			}
+			point = m.outOfOrderPoints[oi]
 			oi++
 		}else {
-			if err := encoder.encodePoint(m.points[pi]);err != nil{
-				return err
-			}
+			point = m.points[pi]
 			pi ++
+		}
+		if err := encoder.Append(point.Timestamp, point.Value);err != nil{
+			return err
 		}
 	}
 	for oi < len(m.outOfOrderPoints) {
-		if err := encoder.encodePoint(m.outOfOrderPoints[oi]);err != nil{
+		point = m.outOfOrderPoints[oi]
+		if err := encoder.Append(point.Timestamp, point.Value);err != nil{
 			return err
 		}
 	}
 	for pi < len(m.points){
-		if err := encoder.encodePoint(m.points[pi]);err != nil{
+		point = m.points[pi]
+		if err := encoder.Append(point.Timestamp, point.Value);err != nil{
 			return err
 		}
 	}

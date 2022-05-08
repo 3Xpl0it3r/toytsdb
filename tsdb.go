@@ -337,8 +337,8 @@ func (db *TSBD) flush(dirPath string, m *MemPartition) error {
 	}
 	defer f.Close()
 
-	encoder := newSeriesEncoder(f)
-	metrics := map[string]diskMetric{}
+	encoder := NewXorChunk(f)
+	metrics := map[uint64]diskMetric{}
 	m.metrics.Range(func(key, value interface{}) bool {
 		mt, ok := value.(*memoryMetric)
 		if !ok {
@@ -360,7 +360,7 @@ func (db *TSBD) flush(dirPath string, m *MemPartition) error {
 			Name:          mt.name,
 			Offset:        offset,
 			MinTimestamp:  mt.minTimestamp,
-			MaxTimestamp:  mt.maxTimestmap,
+			MaxTimestamp:  mt.maxTimestamp,
 			NumDataPoints: mt.size + int64(len(mt.outOfOrderPoints)),
 		}
 		return true
