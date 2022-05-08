@@ -14,9 +14,9 @@ func Test_storage_Select(t *testing.T){
 		//{Labels: []Label{{Name: "__name__", Value: "metric1"}}, Sample: Sample{Timestamp: 3}},
 	})
 	require.NoError(t, err)
-	list := newPartitionList()
-	list.insert(head)
-	db := TSBD{partitionList: list, workerLimitCh: make(chan struct{}), }
+
+
+	db := TSBD{blocks: []*DiskPartition{}, head: head, workerLimitCh: make(chan struct{}), }
 
 	got,err := db.Select([]Label{{Name: "__name__", Value: "metric1"}},0 , 4)
 	require.NoError(t, err)

@@ -56,7 +56,7 @@ type diskMetric struct {
 	NumDataPoints int64 `json:"num_data_points"`
 }
 
-func openDiskPartition(dirPath string, retention time.Duration)(partition, error){
+func openDiskPartition(dirPath string, retention time.Duration)(*DiskPartition, error){
 	if dirPath == ""{
 		return nil, fmt.Errorf("dir path is required")
 	}

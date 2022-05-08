@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-var _ partition = new(MemPartition)
 
 type MemPartition struct {
 	metrics sync.Map
@@ -24,10 +23,30 @@ type MemPartition struct {
 	partitionDuration int64
 	timestampPrecision TimestampPrecision
 	once sync.Once
+
+	labelIndex labelIndex
 }
 
 
-func newMemoryPartition(wal Wal, partitionDuration time.Duration, precision TimestampPrecision)partition{
+
+type labelIndex map[Label][]uint64
+func (li labelIndex)addLabel(l Label, ref uint64){
+	refList, ok := li[l]
+	if !ok {
+		li[l] = []uint64{ref}
+	}
+	refList = append(refList, ref)
+	for i := len(refList)-1; i >=1 ;i --{
+		if refList[i-1] > refList[i]{
+			refList[i-1] = refList[i-1] ^ refList[i]
+			refList[i] = refList[i-1] ^ refList[i]
+			refList[i-1] = refList[i-1] ^ refList[i]
+		}
+	}
+}
+
+
+func newMemoryPartition(wal Wal, partitionDuration time.Duration, precision TimestampPrecision)*MemPartition{
 	if wal == nil{
 		wal = &nopWal{}
 	}
@@ -48,6 +67,7 @@ func newMemoryPartition(wal Wal, partitionDuration time.Duration, precision Time
 		partitionDuration:  d,
 		timestampPrecision: precision,
 		wal: wal,
+		labelIndex: map[Label][]uint64{},
 	}
 }
 
@@ -87,7 +107,11 @@ func (m *MemPartition) insertRows(rows []Row) ( []Row,  error) {
 		if row.Timestamp > maxTimestamp{
 			m.maxT = row.Timestamp
 		}
-		mt := m.getMetric(row.Labels.Hash())
+		ref := row.Labels.Hash()
+		mt := m.getMetric(ref)
+		for _,label := range row.Labels{
+			m.labelIndex.addLabel(label, ref)
+		}
 		mt.insertPoint(&row.Sample)
 		rowsNum ++
 	}
@@ -154,7 +178,10 @@ type memoryMetric struct {
 	points []*Sample
 	outOfOrderPoints []*Sample
 	mu sync.RWMutex
+
+	//labelIndex map[Label][]uint64
 }
+
 
 func(m *memoryMetric)insertPoint(point *Sample){
 	size := atomic.LoadInt64(&m.size)

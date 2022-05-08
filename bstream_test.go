@@ -144,7 +144,7 @@ func Test_BStream_ReadByte(t *testing.T){
 			name: "read block is enough",
 			reader: bStream{
 				stream: []byte{1,0},
-				count:  1,
+				count:  8,
 			},
 			expectedValue:1,
 			expectedErr: nil,
@@ -216,3 +216,32 @@ func Test_BStream_ReadBits(t *testing.T){
 	}
 }
 
+
+func Test_Bstream_Handler(t *testing.T){
+	writer := newBWriter(1024);
+	for _i := 0; _i < 10; _i ++{
+		writer.writeBit(_i/2 == 0)
+	}
+	for _i := 1; _i <= 128; _i ++{
+		writer.writeByte(byte(_i))
+	}
+	for _i := 1; _i < 64; _i ++{
+		writer.writeBits(uint64(_i), 7)
+	}
+	reader := newBReader(writer.clone().bytes())
+	for _i := 0; _i < 10; _i ++{
+		gotV, gotErr := reader.readBit()
+		require.NoError(t, gotErr)
+		require.Equal(t, bit(_i/2 == 0), gotV)
+	}
+	for _i := 1; _i <= 128; _i ++{
+		gotV, gotErr := reader.readByte()
+		require.NoError(t, gotErr)
+		require.Equal(t, byte(_i), gotV)
+	}
+	for _i := 1; _i < 64; _i ++{
+		gotV, gotErr := reader.readBits(7)
+		require.NoError(t, gotErr)
+		require.Equal(t, uint64(_i), gotV)
+	}
+}

@@ -69,7 +69,8 @@ type Sample struct {
 type Option func(*TSBD)
 
 type TSBD struct {
-	partitionList partitionList
+	blocks []*DiskPartition
+	head *MemPartition
 
 	wal                Wal
 	partitionDuration  time.Duration
@@ -91,7 +92,7 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 		return nil, fmt.Errorf("create db directory failed: %s", err.Error())
 	}
 	db := &TSBD{
-		partitionList:      newPartitionList(),
+		blocks:      make([]*DiskPartition, 0),
 		wg:                 sync.WaitGroup{},
 		stopCh:             make(chan struct{}),
 		partitionDuration:  defaultPartitionDuration,
@@ -107,7 +108,7 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 	if db.inMemoryMode() {
 		// 内存模式，只需要一个内存分区就可以
 		//db.partitionList.insert(newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision))
-		db.newPartition(nil, false)
+		db.head = newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision)
 		return db, nil
 	}
 	if err := os.Mkdir(db.dataPath, fs.ModePerm); err != nil && !errors.Is(err, os.ErrExist) {
@@ -129,7 +130,7 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 		return nil, fmt.Errorf("faile open data direcotory : %w", err)
 	}
 	if len(dirs) == 0 {
-		db.newPartition(nil, false)
+		db.head = newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision)
 		//db.partitionList.insert(newMemoryPartition(db.wal, db.partitionDuration, db.timestampPrecision))
 		return db, nil
 	}
@@ -137,26 +138,23 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 	isPartitionDir := func(f fs.DirEntry) bool {
 		return f.IsDir() && partitionDirRegx.MatchString(f.Name())
 	}
-	partitions := make([]partition, 0, len(dirs))
+
 	for _, e := range dirs {
 		if !isPartitionDir(e) {
 			continue
 		}
 		path := filepath.Join(db.dataPath, e.Name())
-		part, err := openDiskPartition(path, db.retention)
+		block, err := openDiskPartition(path, db.retention)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open disk partition  for %s: %w", path, err)
 		}
-		partitions = append(partitions, part)
+		db.blocks = append(db.blocks, block)
 	}
-	sort.Slice(partitions, func(i, j int) bool {
-		return partitions[i].minTimestamp() < partitions[j].minTimestamp()
+	sort.Slice(db.blocks, func(i, j int) bool {
+		return db.blocks[i].minTimestamp() < db.blocks[j].minTimestamp()
 	})
-	for _, p := range partitions {
-		db.newPartition(p, false)
-		//db.partitionList.insert(p)
-	}
-	db.newPartition(nil, false)
+
+	db.head = newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision)
 	//db.partitionList.insert(newMemoryPartition(db.wal, db.partitionDuration, db.timestampPrecision))
 	if err := db.recoverWAL(walDir); err != nil {
 		return nil, fmt.Errorf("failed to recovery wal log %w", err)
@@ -169,43 +167,14 @@ func (db *TSBD) InsertRows(rows []Row) error {
 	db.wg.Add(1)
 	defer db.wg.Done()
 
-	if err := db.ensureActiveHead(); err != nil {
+	if _, err := db.head.insertRows(rows);err != nil{
 		return err
 	}
-	count := 0
-	for cur := db.partitionList.getHead(); cur != nil; cur = cur.getNext() {
-		if len(rows) == 0 || count >= db.partitionList.size() {
-			break
-		}
-		outOfDatedRows, err := cur.value().insertRows(rows)
-		if err != nil {
-			return fmt.Errorf("failed to insert rows %w", err)
-		}
-		rows = outOfDatedRows
-		count++
-	}
+
 	return nil
 }
 
-func (db *TSBD) ensureActiveHead() error {
 
-	head := db.partitionList.getHead()
-	if head != nil && head.value().active() {
-		return nil
-	}
-
-	//p := newMemoryPartition(db.wal, db.partitionDuration, db.timestampPrecision)
-	//db.partitionList.insert(p)
-	if err := db.newPartition(nil, true); err != nil {
-		return err
-	}
-	go func() {
-		if err := db.flushPartitions(); err != nil {
-			fmt.Printf("failed to flush in-mempry parition")
-		}
-	}()
-	return nil
-}
 
 func (db *TSBD) Select(labels Labels, start, end int64) ([]*Sample, error) {
 	if labels.Empty(){
@@ -216,24 +185,19 @@ func (db *TSBD) Select(labels Labels, start, end int64) ([]*Sample, error) {
 	}
 	points := make([]*Sample, 0)
 	// iterate over all partitions from the neweast one
-	curPartition := db.partitionList.getHead()
-	for curPartition != nil {
-		if curPartition.value().minTimestamp() == 0 {
-			continue
-		}
-		if curPartition.value().maxTimestamp() < start {
-			break
-		}
-		if curPartition.value().minTimestamp() > end {
-			continue
-		}
-		ps, err := curPartition.value().selectDataPoints(labels, start, end)
-		if err != nil {
-			return nil, fmt.Errorf("failed to select data points : %w", err)
-		}
-		points = append(points, ps...)
-		curPartition = curPartition.next
+	if samples, err := db.head.selectDataPoints(labels, start,end);err != nil{
+		return nil, err
+	}else {
+		points = append(points, samples...)
 	}
+	for _, block := range db.blocks{
+		if ps,err := block.selectDataPoints(labels, start, end);err != nil{
+			return nil, err
+		}else {
+			points = append(points, ps...)
+		}
+	}
+
 	if len(points) == 0 {
 		return nil, fmt.Errorf("ErrNoDataPoints")
 	}
@@ -244,23 +208,14 @@ func (db *TSBD) Close() error {
 	// todo
 	db.wg.Wait()
 
-
 	if err := db.wal.flush(); err != nil {
 		return fmt.Errorf("failed flush buffer wal %w", err)
 	}
-	for i := 0; i < defaultWriteablePartitionsNum; i++ {
-		if err := db.newPartition(nil, true); err != nil {
-			return err
-		}
-		//p := newMemoryPartition(db.wal, db.partitionDuration, db.timestampPrecision)
-		//db.partitionList.insert(p)
-	}
+
 	if err := db.flushPartitions(); err != nil {
 		return fmt.Errorf("failed to close TSBD : %w", err)
 	}
-	if err := db.removeExpiredPartitions(); err != nil {
-		return fmt.Errorf("failed to remove expired partition %w", err)
-	}
+	db.removeExpiredPartitions()
 	if err := db.wal.removeAll(); err != nil {
 		return fmt.Errorf("failed to remove wal %w", err)
 	}
@@ -270,61 +225,25 @@ func (db *TSBD) Close() error {
 // flushPartitions persists all in-memory partitions ready to persisted
 // For the in-memory mode, just removes it from the partition list
 func (db *TSBD) flushPartitions() error {
-	i := 0
-	curNode := db.partitionList.getHead()
-	for curNode != nil {
-		if i < defaultWriteablePartitionsNum {
-			// 保留两个memory partitions
-			i++
-			curNode = curNode.getNext()
-			continue
-		}
-		memPart, ok := curNode.value().(*MemPartition)
-		if !ok {
-			curNode = curNode.getNext()
-			continue
-		}
-		if db.inMemoryMode() {
-			if err := db.partitionList.remove(memPart); err != nil {
-				return fmt.Errorf("failed to remove partition : %w", err)
-			}
-			curNode = curNode.getNext()
-			continue
-		}
 
-		dir := filepath.Join(db.dataPath, fmt.Sprintf("p-%d-%d", memPart.minTimestamp(), memPart.maxTimestamp()))
-		if err := db.flush(dir, memPart); err != nil {
-			return fmt.Errorf("failed to compact memory parition into %s: %w", dir, err)
+	if db.inMemoryMode(){
+		if err := db.head.clean();err != nil{
+			// log gc error
 		}
-		newPart, err := openDiskPartition(dir, db.retention)
-		if err != nil {
-			return fmt.Errorf("failed to generate disk partition for %s ; %w", dir, err)
-		}
-		if err := db.partitionList.swap(curNode.value(), newPart); err != nil {
-			return fmt.Errorf("failed to swap partition : %w ", err)
-		}
-		if err := db.wal.removeOldest(); err != nil {
-			return fmt.Errorf("failed to truncated %w", err)
-		}
-		curNode = curNode.getNext()
+		db.head = newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision)
+	}
+	dir := filepath.Join(db.dataPath, fmt.Sprintf("b-%d-%d", db.head.minTimestamp(), db.head.maxTimestamp()))
+	if err := db.flush(dir); err != nil {
+		return fmt.Errorf("failed to compact memory parition into %s: %w", dir, err)
 	}
 
 	return nil
 }
 
-func (db *TSBD) newPartition(p partition, punctuateWAL bool) error {
-	if p == nil {
-		p = newMemoryPartition(db.wal, db.partitionDuration, db.timestampPrecision)
-	}
-	db.partitionList.insert(p)
-	if punctuateWAL {
-		return db.wal.punctuate()
-	}
-	return nil
-}
+
 
 // flush compacts the data points in the give partition and flushes them to the given directory
-func (db *TSBD) flush(dirPath string, m *MemPartition) error {
+func (db *TSBD) flush(dirPath string) error {
 	if dirPath == "" {
 		return fmt.Errorf("dir path is requierd ")
 	}
@@ -339,7 +258,7 @@ func (db *TSBD) flush(dirPath string, m *MemPartition) error {
 
 	encoder := NewXorChunk(f)
 	metrics := map[uint64]diskMetric{}
-	m.metrics.Range(func(key, value interface{}) bool {
+	db.head.metrics.Range(func(key, value interface{}) bool {
 		mt, ok := value.(*memoryMetric)
 		if !ok {
 			fmt.Printf("unknown value found\n")
@@ -371,9 +290,9 @@ func (db *TSBD) flush(dirPath string, m *MemPartition) error {
 	}
 
 	b, err := json.Marshal(&BlockMeta{
-		MinTimestamp:  m.minTimestamp(),
-		MaxTimestamp:  m.maxTimestamp(),
-		NumDataPoints: m.size(),
+		MinTimestamp:  db.head.minTimestamp(),
+		MaxTimestamp:  db.head.maxTimestamp(),
+		NumDataPoints: db.head.size(),
 		Metrics:       metrics,
 		CreateAt:      time.Now(),
 	})
@@ -392,20 +311,13 @@ func (db *TSBD) inMemoryMode() bool {
 	return db.dataPath == ""
 }
 
-func (db *TSBD) removeExpiredPartitions() error {
-	expiredList := make([]partition, 0)
-	for cur := db.partitionList.getHead(); cur != nil; cur = cur.getNext() {
-		part := cur.value()
-		if part != nil && part.expired() {
-			expiredList = append(expiredList, part)
+func (db *TSBD) removeExpiredPartitions()  {
+
+	for index, block := range db.blocks{
+		if block.expired() {
+			db.blocks = db.blocks[index:]
 		}
 	}
-	for i := range expiredList {
-		if err := db.partitionList.remove(expiredList[i]); err != nil {
-			return fmt.Errorf("failed to remove expired partition %w", err)
-		}
-	}
-	return nil
 }
 
 func (db *TSBD) recoverWAL(walDir string) error {

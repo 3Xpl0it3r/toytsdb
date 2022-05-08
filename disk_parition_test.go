@@ -11,7 +11,7 @@ func TestOpenDiskPartition(t *testing.T){
 		name string
 		dirPath string
 		retention time.Duration
-		want partition
+		want *DiskPartition
 		wantErr bool
 	}{
 		{

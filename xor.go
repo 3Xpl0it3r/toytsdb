@@ -45,7 +45,6 @@ import (
 //	Value()(int64, float64)
 //}
 
-
 type XORChunk struct {
 	// backend stream writer
 	w io.Writer
@@ -68,7 +67,7 @@ func NewXorChunk(writer io.Writer) *XORChunk {
 	s := XORChunk{
 		T0:      time.Now().Unix(),
 		leading: ^uint8(0),
-		w: writer,
+		w:       writer,
 	}
 	s.bw.writeBits(uint64(s.T0), 64)
 
@@ -114,7 +113,7 @@ func (e *XORChunk) Append(t int64, v float64) error {
 		return nil
 	}
 	// compression time stamps
-	tDelta :=uint32(t - e.t )            // delta
+	tDelta := uint32(t - e.t)       // delta
 	dod := int32(tDelta - e.tDelta) // delta of delta
 	switch {
 	case dod == 0:
@@ -221,8 +220,6 @@ func newIterator(r io.Reader) (*XORIterator, error) {
 	}
 	return &XORIterator{T0: int64(t0), br: *br}, nil
 }
-
-
 
 func (it *XORIterator) Next() error {
 	if it.err != nil || it.finished {
