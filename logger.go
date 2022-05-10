@@ -1,6 +1,5 @@
 package toytsdb
 
-
 type Logger interface {
 	Printf(format string, v ...interface{})
 }
@@ -8,7 +7,6 @@ type Logger interface {
 type nopLogger struct {
 }
 
-
-func(l *nopLogger)Log(_ string, _ ...interface{}){
+func (l *nopLogger) Log(_ string, _ ...interface{}) {
 	return
 }

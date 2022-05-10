@@ -5,40 +5,32 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"sync/atomic"
 )
 
-type walOperation byte
-
-const (
-	operationInsert walOperation = iota
-)
-
 type RefSeries struct {
-	Ref uint64
+	Ref    uint64
 	Labels []Label
 }
 
 type RefSample struct {
 	Ref uint64
-	T int64
-	V float64
+	T   int64
+	V   float64
 }
 
-// WAL is a write ahead log that is used to log series and log samples	
+// WAL is a write ahead log that is used to log series and log samples
 type Wal interface {
-	LogSeries([]RefSeries)error
-	LogSamples([]RefSample)error
-	Truncate(mint int64, keep func(uint64)bool)error
-	Close()error
-	append(op walOperation, rows []Row) error
+	LogSeries([]RefSeries) error
+	LogSamples([]RefSample) error
+	Truncate(mint int64, keep func(uint64) bool) error
+	Close() error
+	append(rows []Row) error
 	flush() error
 	punctuate() error
 	removeOldest() error
@@ -53,6 +45,7 @@ type diskWal struct {
 	fd           *os.File
 	bufferedSize int
 	mu           sync.Mutex
+	xorChunk     XORChunk
 
 	index uint32
 }
@@ -73,44 +66,39 @@ func (d *diskWal) Truncate(mint int64, keep func(uint64) bool) error {
 }
 
 func (d *diskWal) Close() error {
-	// todo
-	return nil
+	if err := d.flush(); err != nil {
+		return err
+	}
+	return d.fd.Close()
 }
 
 // append appends the given entry to the end of file via the file description it has
-func (d *diskWal) append(op walOperation, rows []Row) error {
+func (d *diskWal) append(rows []Row) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	switch op {
-	case operationInsert:
-		for _, row := range rows {
-			if err := d.w.WriteByte(byte(op)); err != nil {
-				return fmt.Errorf("failed to write operation %w\n", err)
-			}
-			name := strconv.Itoa(int(row.Labels.Hash()))
-			lBuf := make([]byte, binary.MaxVarintLen64)
-			n := binary.PutUvarint(lBuf, uint64(len(name)))
-			if _, err := d.w.Write(lBuf[:n]); err != nil {
-				return fmt.Errorf("failed to write the length metrics name :%w", err)
-			}
-			//write metrics name
-			if _, err := d.w.WriteString(name); err != nil {
-				return fmt.Errorf("failed to write metrics string %w", err)
-			}
 
-			tsBuf := make([]byte, 0, binary.MaxVarintLen64)
-			n = binary.PutVarint(tsBuf, row.Sample.Timestamp)
-			if _, err := d.w.Write(tsBuf[:n]); err != nil {
-				return fmt.Errorf("failed to write timestamp")
-			}
-			vBuf := make([]byte, 0, binary.MaxVarintLen64)
-			n = binary.PutUvarint(vBuf, math.Float64bits(row.Sample.Value))
-			if _, err := d.w.Write(vBuf[:n]); err != nil {
-				return fmt.Errorf("failed to write the value")
-			}
+	for _, row := range rows {
+		// write ref into wal
+		refBuf := make([]byte, binary.MaxVarintLen64)
+		n := binary.PutUvarint(refBuf, row.Labels.Hash())
+		if _, err := d.w.Write(refBuf); err != nil {
+			return err
 		}
-	default:
-		return fmt.Errorf("unknown operation %v", op)
+
+		tsBuf := make([]byte, binary.MaxVarintLen64)
+		n = binary.PutVarint(tsBuf, row.Sample.Timestamp)
+		if _, err := d.w.Write(tsBuf[:n]); err != nil {
+			return fmt.Errorf("failed to write timestamp")
+		}
+		vBuf := make([]byte, binary.MaxVarintLen64)
+		n = binary.PutUvarint(vBuf, math.Float64bits(row.Sample.Value))
+		if _, err := d.w.Write(vBuf[:n]); err != nil {
+			return fmt.Errorf("failed to write the value")
+		}
+	}
+
+	if err := d.w.Flush();err != nil{
+		return fmt.Errorf("failed to flush data into underlay storage")
 	}
 	if d.bufferedSize == 0 {
 		return d.flush()
@@ -190,7 +178,7 @@ func newDiskWAL(dir string, bufferedSize int) (Wal, error) {
 	if err := os.MkdirAll(dir, fs.ModePerm); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("failed to make wal dir: %w", err)
 	}
-	w := &diskWal{dir: dir, bufferedSize: bufferedSize}
+	w := &diskWal{dir: dir, bufferedSize: bufferedSize, index: 0}
 	f, err := w.createSegmentFile(dir)
 	if err != nil {
 		return nil, err
@@ -201,7 +189,7 @@ func newDiskWAL(dir string, bufferedSize int) (Wal, error) {
 }
 
 func (d *diskWal) createSegmentFile(dir string) (*os.File, error) {
-	name := strconv.Itoa(int(atomic.LoadUint32(&d.index)))
+	name := fmt.Sprintf("%d", atomic.LoadUint32(&d.index))
 	f, err := os.OpenFile(filepath.Join(dir, name), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create segment file failed: %w", err)
@@ -212,7 +200,7 @@ func (d *diskWal) createSegmentFile(dir string) (*os.File, error) {
 }
 
 type walRecord struct {
-	op  walOperation
+	ref uint64
 	row Row
 }
 
@@ -251,10 +239,8 @@ func (f *diskWALReader) readAll() error {
 
 		for segment.next() {
 			rec := segment.record()
-			switch rec.op {
-			case operationInsert:
-				f.rowsToInsert = append(f.rowsToInsert, rec.row)
-			}
+
+			f.rowsToInsert = append(f.rowsToInsert, rec.row)
 		}
 		if err := segment.close(); err != nil {
 			return err
@@ -274,50 +260,32 @@ type segment struct {
 }
 
 func (f *segment) next() bool {
-	op, err := f.r.ReadByte()
-	if errors.Is(err, io.EOF) {
-		return false
-	}
+	//read ref
+	ref, err := binary.ReadUvarint(f.r)
 	if err != nil {
-		f.err = err
 		return false
 	}
-	switch walOperation(op) {
-	case operationInsert:
-		metricLen, err := binary.ReadUvarint(f.r)
-		if err != nil {
-			f.err = fmt.Errorf("failed to read the length of metric name %w", err)
-			return false
-		}
-		metrics := make([]byte, int(metricLen))
-		if _, err := io.ReadFull(f.r, metrics); err != nil {
-			f.err = fmt.Errorf("failed to read the metrics %w", err)
-			return false
-		}
-		// read the timestamp
-		ts, err := binary.ReadVarint(f.r)
-		if err != nil {
-			f.err = fmt.Errorf("failed to read timestamp %w", err)
-			return false
-		}
-		val, err := binary.ReadUvarint(f.r)
-		if err != nil {
-			f.err = fmt.Errorf("failed to read values %w", err)
-			return false
-		}
-		f.current = walRecord{
-			op: walOperation(op),
-			row: Row{
-				Sample: Sample{
-					Value:     math.Float64frombits(val),
-					Timestamp: ts,
-				},
+	// read the timestamp
+	ts, err := binary.ReadVarint(f.r)
+	if err != nil {
+		f.err = fmt.Errorf("failed to read timestamp %w", err)
+		return false
+	}
+	val, err := binary.ReadUvarint(f.r)
+	if err != nil {
+		f.err = fmt.Errorf("failed to read values %w", err)
+		return false
+	}
+	f.current = walRecord{
+		ref: ref,
+		row: Row{
+			Sample: Sample{
+				Value:     math.Float64frombits(val),
+				Timestamp: ts,
 			},
-		}
-	default:
-		f.err = fmt.Errorf("unknown operation %v found", op)
-		return false
+		},
 	}
+
 	return true
 }
 
@@ -375,6 +343,6 @@ func (f *nopWal) refresh() error {
 
 var _ Wal = new(nopWal)
 
-func (f *nopWal) append(_ walOperation, _ []Row) error {
+func (f *nopWal) append(_ []Row) error {
 	return nil
 }

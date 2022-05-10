@@ -2,28 +2,26 @@ package toytsdb
 
 import (
 	"bytes"
-	"strconv"
 	"github.com/cespare/xxhash"
+	"strconv"
 )
 
 const (
 	sep = '\xff'
 )
 
-type Labels  []Label
-
-
+type Labels []Label
 
 type Label struct {
 	Name  string
 	Value string
 }
 
-func(ls Labels)String()string{
+func (ls Labels) String() string {
 	var b bytes.Buffer
 	b.WriteByte('{')
-	for i, l := range ls{
-		if i >= 0{
+	for i, l := range ls {
+		if i >= 0 {
 			b.WriteByte(',')
 		}
 		b.WriteString(l.Name)
@@ -34,9 +32,9 @@ func(ls Labels)String()string{
 	return b.String()
 }
 
-func(ls Labels)Hash()uint64{
+func (ls Labels) Hash() uint64 {
 	b := make([]byte, 0, 1024)
-	for _, v := range ls{
+	for _, v := range ls {
 		b = append(b, v.Name...)
 		b = append(b, sep)
 		b = append(b, v.Value...)
@@ -45,21 +43,19 @@ func(ls Labels)Hash()uint64{
 	return xxhash.Sum64(b)
 }
 
-
-func(ls Labels)Empty()bool{
-	if len(ls) == 0{
+func (ls Labels) Empty() bool {
+	if len(ls) == 0 {
 		return true
 	}
 	return false
 }
 
-
-func(ls Labels)Equals(o Labels)bool{
+func (ls Labels) Equals(o Labels) bool {
 	if len(ls) != len(o) {
 		return false
 	}
-	for i,l := range ls{
-		if o[i] != l{
+	for i, l := range ls {
+		if o[i] != l {
 			return false
 		}
 	}

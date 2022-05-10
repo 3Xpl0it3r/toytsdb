@@ -5,16 +5,16 @@ import (
 	"github.com/3Xpl0it3r/toytsdb"
 )
 
-func main(){
-	s,err := toytsdb.OpenTSDB("pdata")
-	if err != nil{
+func main() {
+	s, err := toytsdb.OpenTSDB("pdata")
+	if err != nil {
 		panic(err)
 	}
 	_ = s.InsertRows([]toytsdb.Row{
 		{
 			Labels: []toytsdb.Label{
 				{
-					Name: "__name__",
+					Name:  "__name__",
 					Value: "metric1",
 				},
 			},

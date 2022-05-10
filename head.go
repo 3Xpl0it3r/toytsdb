@@ -2,6 +2,7 @@ package toytsdb
 
 import (
 	"fmt"
+	"path"
 	"runtime"
 	"sort"
 	"sync"
@@ -9,9 +10,8 @@ import (
 	"time"
 )
 
-
 type MemPartition struct {
-	metrics sync.Map
+	metrics   sync.Map
 	numPoints int64
 
 	minT int64
@@ -20,24 +20,23 @@ type MemPartition struct {
 	// write ahead log
 	wal Wal
 	// The timestamp range of partition after which they get persisted
-	partitionDuration int64
+	partitionDuration  int64
 	timestampPrecision TimestampPrecision
-	once sync.Once
+	once               sync.Once
 
 	labelIndex labelIndex
 }
 
-
-
 type labelIndex map[Label][]uint64
-func (li labelIndex)addLabel(l Label, ref uint64){
+
+func (li labelIndex) addLabel(l Label, ref uint64) {
 	refList, ok := li[l]
 	if !ok {
 		li[l] = []uint64{ref}
 	}
 	refList = append(refList, ref)
-	for i := len(refList)-1; i >=1 ;i --{
-		if refList[i-1] > refList[i]{
+	for i := len(refList) - 1; i >= 1; i-- {
+		if refList[i-1] > refList[i] {
 			refList[i-1] = refList[i-1] ^ refList[i]
 			refList[i] = refList[i-1] ^ refList[i]
 			refList[i-1] = refList[i-1] ^ refList[i]
@@ -45,47 +44,51 @@ func (li labelIndex)addLabel(l Label, ref uint64){
 	}
 }
 
-
-func newMemoryPartition(wal Wal, partitionDuration time.Duration, precision TimestampPrecision)*MemPartition{
-	if wal == nil{
-		wal = &nopWal{}
+func newMemoryPartition(dbDir string, walBufSize int, partitionDuration time.Duration, precision TimestampPrecision) (*MemPartition, error) {
+	memPartition := &MemPartition{
+		timestampPrecision: precision,
+		labelIndex:         map[Label][]uint64{},
 	}
-	var d int64
+
+	if walBufSize == 0 {
+		memPartition.wal = &nopWal{}
+	} else {
+		if wal, err := newDiskWAL(path.Join(dbDir, "wal"), walBufSize); err != nil {
+			return nil, err
+		} else {
+			memPartition.wal = wal
+		}
+	}
+
 	switch precision {
 	case Nanoseconds:
-		d = partitionDuration.Nanoseconds()
+		memPartition.partitionDuration = partitionDuration.Nanoseconds()
 	case Microseconds:
-		d = partitionDuration.Microseconds()
+		memPartition.partitionDuration = partitionDuration.Microseconds()
 	case Milliseconds:
-		d = partitionDuration.Milliseconds()
+		memPartition.partitionDuration = partitionDuration.Milliseconds()
 	case Seconds:
-		d = int64(partitionDuration.Seconds())
+		memPartition.partitionDuration = int64(partitionDuration.Seconds())
 	default:
-		d = partitionDuration.Nanoseconds()
+		memPartition.partitionDuration = partitionDuration.Nanoseconds()
 	}
-	return &MemPartition{
-		partitionDuration:  d,
-		timestampPrecision: precision,
-		wal: wal,
-		labelIndex: map[Label][]uint64{},
-	}
+	return memPartition, nil
 }
 
-
-func (m *MemPartition) insertRows(rows []Row) ( []Row,  error) {
-	if len(rows) == 0{
+func (m *MemPartition) insertRows(rows []Row) ([]Row, error) {
+	if len(rows) == 0 {
 		return nil, fmt.Errorf("no rows given ")
 	}
-	if err := m.wal.append(operationInsert, rows);err != nil{
-		return nil, fmt.Errorf("failed to write to wal %w",err)
+	if err := m.wal.append(rows); err != nil {
+		return nil, fmt.Errorf("failed to write to wal %w", err)
 	}
 
 	// Set min timestamp at only first
 	m.once.Do(func() {
 		min := rows[0].Timestamp
-		for i := range rows{
+		for i := range rows {
 			row := rows[i]
-			if row.Timestamp < min{
+			if row.Timestamp < min {
 				min = row.Timestamp
 			}
 		}
@@ -94,31 +97,31 @@ func (m *MemPartition) insertRows(rows []Row) ( []Row,  error) {
 	outdatedRows := make([]Row, 0)
 	maxTimestamp := rows[0].Timestamp
 	var rowsNum int64
-	for i := range rows{
+	for i := range rows {
 		row := rows[i]
-		if row.Timestamp < m.minTimestamp(){
+		if row.Timestamp < m.minTimestamp() {
 			outdatedRows = append(outdatedRows, row)
 			continue
 		}
 
-		if row.Timestamp == 0{
+		if row.Timestamp == 0 {
 			row.Timestamp = toUnix(time.Now(), m.timestampPrecision)
 		}
-		if row.Timestamp > maxTimestamp{
+		if row.Timestamp > maxTimestamp {
 			m.maxT = row.Timestamp
 		}
 		ref := row.Labels.Hash()
 		mt := m.getMetric(ref)
-		for _,label := range row.Labels{
+		for _, label := range row.Labels {
 			m.labelIndex.addLabel(label, ref)
 		}
 		mt.insertPoint(&row.Sample)
-		rowsNum ++
+		rowsNum++
 	}
 	atomic.AddInt64(&m.numPoints, rowsNum)
 
 	// Make max timestamp up-to-date
-	if atomic.LoadInt64(&m.maxT) < maxTimestamp{
+	if atomic.LoadInt64(&m.maxT) < maxTimestamp {
 		atomic.SwapInt64(&m.maxT, maxTimestamp)
 	}
 	return outdatedRows, nil
@@ -142,53 +145,51 @@ func (m *MemPartition) size() int {
 }
 
 func (m *MemPartition) active() bool {
-	return m.maxTimestamp() - m.minTimestamp() + 1 < m.partitionDuration
+	return m.maxTimestamp()-m.minTimestamp()+1 < m.partitionDuration
 }
 
-func(m *MemPartition)getMetric(name uint64)*memoryMetric{
+func (m *MemPartition) getMetric(name uint64) *memoryMetric {
 	// 使用并发map来实现， prometheues 里面采用了分片锁来提高并发行
 	// todo 更换成分片锁
-	value,ok := m.metrics.Load(name)
+	value, ok := m.metrics.Load(name)
 	if !ok {
 		value = &memoryMetric{
 			name:             name,
-			points:           make([]*Sample,0, 1000),
-			outOfOrderPoints: make([]*Sample,0),
+			points:           make([]*Sample, 0, 1000),
+			outOfOrderPoints: make([]*Sample, 0),
 		}
 		m.metrics.Store(name, value)
 	}
 	return value.(*memoryMetric)
 }
 
-func(m *MemPartition)clean()error{
+func (m *MemPartition) clean() error {
 	runtime.GC()
 	return nil
 }
 
-func (f *MemPartition) expired() bool {
+func (m *MemPartition) expired() bool {
 	return false
 }
 
 type memoryMetric struct {
-	name uint64
-	size int64
+	name         uint64
+	size         int64
 	minTimestamp int64
 	maxTimestamp int64
 
-	points []*Sample
+	points           []*Sample
 	outOfOrderPoints []*Sample
-	mu sync.RWMutex
-
+	mu               sync.RWMutex
 	//labelIndex map[Label][]uint64
 }
 
-
-func(m *memoryMetric)insertPoint(point *Sample){
+func (m *memoryMetric) insertPoint(point *Sample) {
 	size := atomic.LoadInt64(&m.size)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if size == 0{
+	if size == 0 {
 		m.points = append(m.points, point)
 		atomic.StoreInt64(&m.minTimestamp, point.Timestamp)
 		atomic.StoreInt64(&m.maxTimestamp, point.Timestamp)
@@ -197,7 +198,7 @@ func(m *memoryMetric)insertPoint(point *Sample){
 	}
 
 	// Insert point in order
-	if m.points[size-1].Timestamp < point.Timestamp{
+	if m.points[size-1].Timestamp < point.Timestamp {
 		m.points = append(m.points, point)
 		atomic.SwapInt64(&m.maxTimestamp, point.Timestamp)
 		atomic.AddInt64(&m.size, 1)
@@ -206,37 +207,36 @@ func(m *memoryMetric)insertPoint(point *Sample){
 	m.outOfOrderPoints = append(m.outOfOrderPoints, point)
 }
 
-
-func(m *memoryMetric)selectPoints(start, end int64)[]*Sample{
+func (m *memoryMetric) selectPoints(start, end int64) []*Sample {
 	size := atomic.LoadInt64(&m.size)
 	minTimestamp := atomic.LoadInt64(&m.minTimestamp)
 	maxTimestamp := atomic.LoadInt64(&m.maxTimestamp)
 	var startIdx, endIdx int
-	if end <= minTimestamp{
+	if end <= minTimestamp {
 		return []*Sample{}
 	}
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if start <= minTimestamp{
+	if start <= minTimestamp {
 		startIdx = 0
-	}else {
+	} else {
 		startIdx = sort.Search(int(size), func(i int) bool {
 			return m.points[i].Timestamp >= start
 		})
 	}
 
-	if end >= maxTimestamp{
+	if end >= maxTimestamp {
 		endIdx = int(size)
-	}else {
+	} else {
 		endIdx = sort.Search(int(size), func(i int) bool {
 			return m.points[i].Timestamp < end
 		})
 	}
-	return m.points[startIdx: endIdx]
+	return m.points[startIdx:endIdx]
 }
 
-func toUnix(t time.Time, precision TimestampPrecision)int64{
+func toUnix(t time.Time, precision TimestampPrecision) int64 {
 	switch precision {
 	case Nanoseconds:
 		return t.UnixNano()
@@ -251,36 +251,35 @@ func toUnix(t time.Time, precision TimestampPrecision)int64{
 	}
 }
 
-
-func(m *memoryMetric)encodeAllDataPoints(encoder *XORChunk)error{
+func (m *memoryMetric) encodeAllDataPoints(encoder *XORChunk) error {
 	// merge sort
 	sort.Slice(m.outOfOrderPoints, func(i, j int) bool {
 		return m.outOfOrderPoints[i].Timestamp < m.outOfOrderPoints[j].Timestamp
 	})
-
 	var oi, pi int
 	var point *Sample
-	for oi < len(m.outOfOrderPoints) && pi < len(m.points){
-		if m.outOfOrderPoints[oi].Timestamp < m.points[pi].Timestamp{
+	for oi < len(m.outOfOrderPoints) && pi < len(m.points) {
+		if m.outOfOrderPoints[oi].Timestamp < m.points[pi].Timestamp {
 			point = m.outOfOrderPoints[oi]
 			oi++
-		}else {
+		} else {
 			point = m.points[pi]
-			pi ++
+			pi++
 		}
-		if err := encoder.Append(point.Timestamp, point.Value);err != nil{
+		if err := encoder.Append(point.Timestamp, point.Value); err != nil {
 			return err
 		}
 	}
-	for oi < len(m.outOfOrderPoints) {
+	for ; oi < len(m.outOfOrderPoints); oi++ {
 		point = m.outOfOrderPoints[oi]
-		if err := encoder.Append(point.Timestamp, point.Value);err != nil{
+		if err := encoder.Append(point.Timestamp, point.Value); err != nil {
 			return err
 		}
+
 	}
-	for pi < len(m.points){
+	for ; pi < len(m.points); pi++ {
 		point = m.points[pi]
-		if err := encoder.Append(point.Timestamp, point.Value);err != nil{
+		if err := encoder.Append(point.Timestamp, point.Value); err != nil {
 			return err
 		}
 	}

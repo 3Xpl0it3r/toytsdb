@@ -15,14 +15,11 @@ import (
 )
 
 var (
-
 	partitionDirRegx = regexp.MustCompile(`^p-.+`)
 )
 
 // TimestampPrecision represents precision of timestamp
 type TimestampPrecision string
-
-
 
 const (
 	Nanoseconds  TimestampPrecision = "ns"
@@ -38,13 +35,6 @@ const (
 	checkExpiredInterval          = time.Hour
 	defaultWALDirName             = "wal"
 )
-
-// Storage provides goroutines safe capabilities of inserting into and retrieval from the time serias
-type Storage interface {
-	Reader
-	InsertRows(rows []Row) error
-	Close() error
-}
 
 // Reader provides reading access of time serial data
 type Reader interface {
@@ -66,13 +56,12 @@ type Sample struct {
 }
 
 // Option is an optional setting for NewStorage
-type Option func(*TSBD)
+type Option func(*TSDB)
 
-type TSBD struct {
+type TSDB struct {
 	blocks []*DiskPartition
-	head *MemPartition
+	head   *MemPartition
 
-	wal                Wal
 	partitionDuration  time.Duration
 	retention          time.Duration
 	timestampPrecision TimestampPrecision
@@ -87,19 +76,19 @@ type TSBD struct {
 	stopCh chan struct{}
 }
 
-func OpenTSDB(dir string, opts ...Option) (Storage, error) {
+func OpenTSDB(dir string, opts ...Option) (*TSDB, error) {
 	if err := os.MkdirAll(dir, fs.ModePerm); err != nil && !errors.Is(os.ErrExist, err) {
 		return nil, fmt.Errorf("create db directory failed: %s", err.Error())
 	}
-	db := &TSBD{
-		blocks:      make([]*DiskPartition, 0),
+	db := &TSDB{
+		blocks:             make([]*DiskPartition, 0),
 		wg:                 sync.WaitGroup{},
 		stopCh:             make(chan struct{}),
 		partitionDuration:  defaultPartitionDuration,
 		retention:          defaultPartitionRetention,
 		timestampPrecision: defaultTimestampPrecision,
 		walBufferedSize:    defaultWALBufferSize,
-		wal:                &nopWal{},
+		dataPath:           dir,
 	}
 	for _, opt := range opts {
 		opt(db)
@@ -108,7 +97,11 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 	if db.inMemoryMode() {
 		// 内存模式，只需要一个内存分区就可以
 		//db.partitionList.insert(newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision))
-		db.head = newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision)
+		if head, err := newMemoryPartition(db.dataPath, db.walBufferedSize, db.partitionDuration, db.timestampPrecision); err != nil {
+			return nil, err
+		} else {
+			db.head = head
+		}
 		return db, nil
 	}
 	if err := os.Mkdir(db.dataPath, fs.ModePerm); err != nil && !errors.Is(err, os.ErrExist) {
@@ -117,21 +110,17 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 
 	// write ahead log
 	walDir := filepath.Join(db.dataPath, "wal")
-	if db.walBufferedSize >= 0 {
-		wal, err := newDiskWAL(walDir, db.walBufferedSize)
-		if err != nil {
-			return nil, err
-		}
-		db.wal = wal
-	}
 
 	dirs, err := os.ReadDir(db.dataPath)
 	if err != nil {
 		return nil, fmt.Errorf("faile open data direcotory : %w", err)
 	}
 	if len(dirs) == 0 {
-		db.head = newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision)
-		//db.partitionList.insert(newMemoryPartition(db.wal, db.partitionDuration, db.timestampPrecision))
+		if head, err := newMemoryPartition(db.dataPath, db.walBufferedSize, db.partitionDuration, db.timestampPrecision); err != nil {
+			return nil, err
+		} else {
+			db.head = head
+		}
 		return db, nil
 	}
 
@@ -154,8 +143,11 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 		return db.blocks[i].minTimestamp() < db.blocks[j].minTimestamp()
 	})
 
-	db.head = newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision)
-	//db.partitionList.insert(newMemoryPartition(db.wal, db.partitionDuration, db.timestampPrecision))
+	if head, err := newMemoryPartition(db.dataPath, db.walBufferedSize, db.partitionDuration, db.timestampPrecision); err != nil {
+		return nil, err
+	} else {
+		db.head = head
+	}
 	if err := db.recoverWAL(walDir); err != nil {
 		return nil, fmt.Errorf("failed to recovery wal log %w", err)
 	}
@@ -163,21 +155,18 @@ func OpenTSDB(dir string, opts ...Option) (Storage, error) {
 	return db, nil
 }
 
-func (db *TSBD) InsertRows(rows []Row) error {
+func (db *TSDB) InsertRows(rows []Row) error {
 	db.wg.Add(1)
 	defer db.wg.Done()
 
-	if _, err := db.head.insertRows(rows);err != nil{
+	if _, err := db.head.insertRows(rows); err != nil {
 		return err
 	}
-
 	return nil
 }
 
-
-
-func (db *TSBD) Select(labels Labels, start, end int64) ([]*Sample, error) {
-	if labels.Empty(){
+func (db *TSDB) Select(labels Labels, start, end int64) ([]*Sample, error) {
+	if labels.Empty() {
 		return nil, fmt.Errorf("labels is empty")
 	}
 	if start >= end {
@@ -185,15 +174,15 @@ func (db *TSBD) Select(labels Labels, start, end int64) ([]*Sample, error) {
 	}
 	points := make([]*Sample, 0)
 	// iterate over all partitions from the neweast one
-	if samples, err := db.head.selectDataPoints(labels, start,end);err != nil{
+	if samples, err := db.head.selectDataPoints(labels, start, end); err != nil {
 		return nil, err
-	}else {
+	} else {
 		points = append(points, samples...)
 	}
-	for _, block := range db.blocks{
-		if ps,err := block.selectDataPoints(labels, start, end);err != nil{
+	for _, block := range db.blocks {
+		if ps, err := block.selectDataPoints(labels, start, end); err != nil {
 			return nil, err
-		}else {
+		} else {
 			points = append(points, ps...)
 		}
 	}
@@ -204,33 +193,31 @@ func (db *TSBD) Select(labels Labels, start, end int64) ([]*Sample, error) {
 	return points, nil
 }
 
-func (db *TSBD) Close() error {
+func (db *TSDB) Close() error {
 	// todo
 	db.wg.Wait()
 
-	if err := db.wal.flush(); err != nil {
-		return fmt.Errorf("failed flush buffer wal %w", err)
-	}
-
 	if err := db.flushPartitions(); err != nil {
-		return fmt.Errorf("failed to close TSBD : %w", err)
+		return fmt.Errorf("failed to close TSDB : %w", err)
 	}
 	db.removeExpiredPartitions()
-	if err := db.wal.removeAll(); err != nil {
-		return fmt.Errorf("failed to remove wal %w", err)
-	}
 	return nil
 }
 
 // flushPartitions persists all in-memory partitions ready to persisted
 // For the in-memory mode, just removes it from the partition list
-func (db *TSBD) flushPartitions() error {
+func (db *TSDB) flushPartitions() error {
 
-	if db.inMemoryMode(){
-		if err := db.head.clean();err != nil{
+	if db.inMemoryMode() {
+		if err := db.head.clean(); err != nil {
 			// log gc error
 		}
-		db.head = newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision)
+
+		if head, err := newMemoryPartition(db.dataPath, db.walBufferedSize, db.partitionDuration, db.timestampPrecision); err != nil {
+			return err
+		} else {
+			db.head = head
+		}
 	}
 	dir := filepath.Join(db.dataPath, fmt.Sprintf("b-%d-%d", db.head.minTimestamp(), db.head.maxTimestamp()))
 	if err := db.flush(dir); err != nil {
@@ -240,10 +227,8 @@ func (db *TSBD) flushPartitions() error {
 	return nil
 }
 
-
-
 // flush compacts the data points in the give partition and flushes them to the given directory
-func (db *TSBD) flush(dirPath string) error {
+func (db *TSDB) flush(dirPath string) error {
 	if dirPath == "" {
 		return fmt.Errorf("dir path is requierd ")
 	}
@@ -304,23 +289,28 @@ func (db *TSBD) flush(dirPath string) error {
 	if err := os.WriteFile(metaPath, b, fs.ModePerm); err != nil {
 		return fmt.Errorf("failed to write metadata to %s: %w", metaPath, err)
 	}
+	if block, err := openDiskPartition(dirPath, db.retention); err != nil {
+		fmt.Printf("open DiskPartition failed ;%v", err)
+	} else {
+		db.blocks = append(db.blocks, block)
+	}
 	return nil
 }
 
-func (db *TSBD) inMemoryMode() bool {
+func (db *TSDB) inMemoryMode() bool {
 	return db.dataPath == ""
 }
 
-func (db *TSBD) removeExpiredPartitions()  {
+func (db *TSDB) removeExpiredPartitions() {
 
-	for index, block := range db.blocks{
+	for index, block := range db.blocks {
 		if block.expired() {
 			db.blocks = db.blocks[index:]
 		}
 	}
 }
 
-func (db *TSBD) recoverWAL(walDir string) error {
+func (db *TSDB) recoverWAL(walDir string) error {
 	reader, err := newDiskWALReader(walDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -337,10 +327,10 @@ func (db *TSBD) recoverWAL(walDir string) error {
 	if err := db.InsertRows(reader.rowsToInsert); err != nil {
 		return fmt.Errorf("failed to insert rows %w", err)
 	}
-	return db.wal.refresh()
+	return nil
 }
 
-func (db *TSBD) run() {
+func (db *TSDB) run() {
 	defer db.Close()
 	for true {
 		select {

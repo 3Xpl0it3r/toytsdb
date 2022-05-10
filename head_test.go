@@ -11,7 +11,6 @@ var (
 	mockRow2 = Row{Labels: []Label{{Name: "__name__", Value: "metric1"}}, Sample: Sample{Timestamp: 2, Value: 0.1}}
 	mockRow3 = Row{Labels: []Label{{Name: "__name__", Value: "metric1"}}, Sample: Sample{Timestamp: 3, Value: 0.1}}
 	mockRow4 = Row{Labels: []Label{{Name: "__name__", Value: "metric1"}}, Sample: Sample{Timestamp: 4, Value: 0.1}}
-
 )
 
 func Test_memoryPartition_InsertRows(t *testing.T) {
@@ -24,8 +23,12 @@ func Test_memoryPartition_InsertRows(t *testing.T) {
 		wantOutOfOrderRows []Row
 	}{
 		{
-			name:            "inset in-order rows",
-			memoryPartition: newMemoryPartition(nil, 0, ""),
+			name: "inset in-order rows",
+			memoryPartition: func() *MemPartition {
+				m, _ := newMemoryPartition("", 0, 0, "")
+
+				return m
+			}(),
 			rows: []Row{mockRow1, mockRow2, mockRow3, mockRow4},
 			wantDatePoints: []*Sample{
 				{Timestamp: 1, Value: 0.1},
@@ -38,18 +41,16 @@ func Test_memoryPartition_InsertRows(t *testing.T) {
 		{
 			name: "insert out-of-order rows",
 			memoryPartition: func() *MemPartition {
-				m := newMemoryPartition(nil, 0, "")
+				m, _ := newMemoryPartition("", 0, 0, "")
 				m.insertRows([]Row{
-					{Labels:
-					[]Label{{Name: "__name__", Value: "metric1"}},
+					{Labels: []Label{{Name: "__name__", Value: "metric1"}},
 						Sample: Sample{Timestamp: 3, Value: 0.1},
 					},
 				})
 				return m
 			}(),
 			rows: []Row{
-				{Labels:
-				[]Label{{Name: "__name__", Value: "metric1"}},
+				{Labels: []Label{{Name: "__name__", Value: "metric1"}},
 					Sample: Sample{Timestamp: 1, Value: 0.1},
 				},
 			},
@@ -57,8 +58,7 @@ func Test_memoryPartition_InsertRows(t *testing.T) {
 				{Timestamp: 3, Value: 0.1},
 			},
 			wantOutOfOrderRows: []Row{
-				{Labels:
-				[]Label{{Name: "__name__", Value: "metric1"}},
+				{Labels: []Label{{Name: "__name__", Value: "metric1"}},
 					Sample: Sample{Timestamp: 1, Value: 0.1},
 				},
 			},
@@ -89,11 +89,14 @@ func Test_memoryPartition_SelectDataPoints(t *testing.T) {
 		want            []*Sample
 	}{
 		{
-			name:            "given non-exist metric name",
-			start:           1,
-			end:             2,
-			memoryPartition: newMemoryPartition(nil, 0, ""),
-			want:            []*Sample{},
+			name:  "given non-exist metric name",
+			start: 1,
+			end:   2,
+			memoryPartition: func() *MemPartition {
+				m, _ := newMemoryPartition("", 0, 0, "")
+				return m
+			}(),
+			want: []*Sample{},
 		},
 		{
 			name:   "select multiple points",
@@ -101,9 +104,9 @@ func Test_memoryPartition_SelectDataPoints(t *testing.T) {
 			start:  0,
 			end:    4,
 			memoryPartition: func() *MemPartition {
-				m := newMemoryPartition(nil, 0, "")
+				m, _ := newMemoryPartition("", 0, 0, "")
 				m.insertRows([]Row{
-					mockRow1,mockRow2,mockRow3,
+					mockRow1, mockRow2, mockRow3,
 				})
 				return m
 			}(),
