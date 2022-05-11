@@ -7,10 +7,11 @@ import (
 
 func main() {
 	s, err := toytsdb.OpenTSDB("pdata")
+	appender := s.Appender()
 	if err != nil {
 		panic(err)
 	}
-	_ = s.InsertRows([]toytsdb.Row{
+	for _, row := range []toytsdb.Row{
 		{
 			Labels: []toytsdb.Label{
 				{
@@ -20,7 +21,10 @@ func main() {
 			},
 			Sample: toytsdb.Sample{Timestamp: 1600000000, Value: 0.1},
 		},
-	})
+	}{
+		appender.Add(row.Labels, row.Timestamp, row.Value)
+	}
+
 	labels := toytsdb.Labels{
 		{
 			Name: "__name__", Value: "metric1",

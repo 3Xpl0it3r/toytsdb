@@ -42,11 +42,13 @@ func Test_memoryPartition_InsertRows(t *testing.T) {
 			name: "insert out-of-order rows",
 			memoryPartition: func() *MemPartition {
 				m, _ := newMemoryPartition("", 0, 0, "")
-				m.insertRows([]Row{
+				for _, row := range []Row{
 					{Labels: []Label{{Name: "__name__", Value: "metric1"}},
 						Sample: Sample{Timestamp: 3, Value: 0.1},
 					},
-				})
+				}{
+					m.Add(row.Labels, row.Timestamp, row.Value)
+				}
 				return m
 			}(),
 			rows: []Row{
@@ -66,9 +68,10 @@ func Test_memoryPartition_InsertRows(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotOutOfOrder, err := tt.memoryPartition.insertRows(tt.rows)
-			assert.Equal(t, tt.wantErr, err != nil)
-			assert.Equal(t, tt.wantOutOfOrderRows, gotOutOfOrder)
+			for _,row := range tt.rows{
+				tt.memoryPartition.Add(row.Labels, row.Timestamp, row.Value)
+			}
+
 			labels := Labels{
 				{Name: "__name__", Value: "metric1"},
 			}
@@ -105,9 +108,12 @@ func Test_memoryPartition_SelectDataPoints(t *testing.T) {
 			end:    4,
 			memoryPartition: func() *MemPartition {
 				m, _ := newMemoryPartition("", 0, 0, "")
-				m.insertRows([]Row{
+				for _, row := range []Row{
 					mockRow1, mockRow2, mockRow3,
-				})
+				}{
+					m.Add(row.Labels, row.Timestamp, row.Value)
+				}
+
 				return m
 			}(),
 			want: []*Sample{

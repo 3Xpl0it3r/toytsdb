@@ -97,7 +97,7 @@ func (d *diskWal) append(rows []Row) error {
 		}
 	}
 
-	if err := d.w.Flush();err != nil{
+	if err := d.w.Flush(); err != nil {
 		return fmt.Errorf("failed to flush data into underlay storage")
 	}
 	if d.bufferedSize == 0 {

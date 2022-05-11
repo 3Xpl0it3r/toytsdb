@@ -36,9 +36,13 @@ const (
 	defaultWALDirName             = "wal"
 )
 
-// Reader provides reading access of time serial data
-type Reader interface {
-	Select(labels Labels, start, end int64) ([]*Sample, error)
+type Appender interface {
+	// Add timestamp and value into appender
+	Add(Labels ,int64,  float64)
+	// Commit submit the collected samples
+	Commit()error
+	// Rollback rolls all modifications into memory partition
+	Rollback()error
 }
 
 type Row struct {
@@ -64,6 +68,7 @@ type TSDB struct {
 
 	partitionDuration  time.Duration
 	retention          time.Duration
+	compact            chan struct{}
 	timestampPrecision TimestampPrecision
 	dataPath           string
 	writeTimeout       time.Duration
@@ -89,21 +94,12 @@ func OpenTSDB(dir string, opts ...Option) (*TSDB, error) {
 		timestampPrecision: defaultTimestampPrecision,
 		walBufferedSize:    defaultWALBufferSize,
 		dataPath:           dir,
+		compact: make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(db)
 	}
 
-	if db.inMemoryMode() {
-		// 内存模式，只需要一个内存分区就可以
-		//db.partitionList.insert(newMemoryPartition(nil, db.partitionDuration, db.timestampPrecision))
-		if head, err := newMemoryPartition(db.dataPath, db.walBufferedSize, db.partitionDuration, db.timestampPrecision); err != nil {
-			return nil, err
-		} else {
-			db.head = head
-		}
-		return db, nil
-	}
 	if err := os.Mkdir(db.dataPath, fs.ModePerm); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("failed to make data directory %v: %w", db.dataPath, err)
 	}
@@ -111,37 +107,9 @@ func OpenTSDB(dir string, opts ...Option) (*TSDB, error) {
 	// write ahead log
 	walDir := filepath.Join(db.dataPath, "wal")
 
-	dirs, err := os.ReadDir(db.dataPath)
-	if err != nil {
-		return nil, fmt.Errorf("faile open data direcotory : %w", err)
+	if err := db.reloadBlock();err != nil{
+		return nil, err
 	}
-	if len(dirs) == 0 {
-		if head, err := newMemoryPartition(db.dataPath, db.walBufferedSize, db.partitionDuration, db.timestampPrecision); err != nil {
-			return nil, err
-		} else {
-			db.head = head
-		}
-		return db, nil
-	}
-
-	isPartitionDir := func(f fs.DirEntry) bool {
-		return f.IsDir() && partitionDirRegx.MatchString(f.Name())
-	}
-
-	for _, e := range dirs {
-		if !isPartitionDir(e) {
-			continue
-		}
-		path := filepath.Join(db.dataPath, e.Name())
-		block, err := openDiskPartition(path, db.retention)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open disk partition  for %s: %w", path, err)
-		}
-		db.blocks = append(db.blocks, block)
-	}
-	sort.Slice(db.blocks, func(i, j int) bool {
-		return db.blocks[i].minTimestamp() < db.blocks[j].minTimestamp()
-	})
 
 	if head, err := newMemoryPartition(db.dataPath, db.walBufferedSize, db.partitionDuration, db.timestampPrecision); err != nil {
 		return nil, err
@@ -155,14 +123,16 @@ func OpenTSDB(dir string, opts ...Option) (*TSDB, error) {
 	return db, nil
 }
 
-func (db *TSDB) InsertRows(rows []Row) error {
-	db.wg.Add(1)
-	defer db.wg.Done()
+type dbAppender struct {
+	Appender
+	db *TSDB
+}
 
-	if _, err := db.head.insertRows(rows); err != nil {
-		return err
+func(db *TSDB)Appender()Appender{
+	return &dbAppender{
+		Appender: db.head,
+		db:       nil,
 	}
-	return nil
 }
 
 func (db *TSDB) Select(labels Labels, start, end int64) ([]*Sample, error) {
@@ -208,17 +178,6 @@ func (db *TSDB) Close() error {
 // For the in-memory mode, just removes it from the partition list
 func (db *TSDB) flushPartitions() error {
 
-	if db.inMemoryMode() {
-		if err := db.head.clean(); err != nil {
-			// log gc error
-		}
-
-		if head, err := newMemoryPartition(db.dataPath, db.walBufferedSize, db.partitionDuration, db.timestampPrecision); err != nil {
-			return err
-		} else {
-			db.head = head
-		}
-	}
 	dir := filepath.Join(db.dataPath, fmt.Sprintf("b-%d-%d", db.head.minTimestamp(), db.head.maxTimestamp()))
 	if err := db.flush(dir); err != nil {
 		return fmt.Errorf("failed to compact memory parition into %s: %w", dir, err)
@@ -297,12 +256,7 @@ func (db *TSDB) flush(dirPath string) error {
 	return nil
 }
 
-func (db *TSDB) inMemoryMode() bool {
-	return db.dataPath == ""
-}
-
 func (db *TSDB) removeExpiredPartitions() {
-
 	for index, block := range db.blocks {
 		if block.expired() {
 			db.blocks = db.blocks[index:]
@@ -324,9 +278,10 @@ func (db *TSDB) recoverWAL(walDir string) error {
 	if len(reader.rowsToInsert) == 0 {
 		return nil
 	}
-	if err := db.InsertRows(reader.rowsToInsert); err != nil {
-		return fmt.Errorf("failed to insert rows %w", err)
+	for _, row := range reader.rowsToInsert{
+		db.Appender().Add(row.Labels, row.Timestamp, row.Value)
 	}
+
 	return nil
 }
 
@@ -336,9 +291,60 @@ func (db *TSDB) run() {
 		select {
 		case <-db.stopCh:
 			return
-		case <-time.After(db.retention):
-			// todo retention
+		case <-db.compact:
+			db.Compact()
 		}
 	}
-
 }
+
+func (db *TSDB)Compact(){
+	// todo compact
+}
+
+//
+func(db *TSDB)reloadBlock()error{
+	dirs, err := os.ReadDir(db.dataPath)
+	if err != nil {
+		return err
+	}
+	if len(dirs) == 0 {
+		return nil
+	}
+
+	var needAdded []fs.DirEntry = []fs.DirEntry{}
+	var newBlocks []*DiskPartition = []*DiskPartition{}
+	var isOpened bool
+	for _, e := range dirs {
+		isOpened = false
+		if !e.IsDir() || !partitionDirRegx.MatchString(e.Name()) {
+			continue
+		}
+		for _, b := range db.blocks{
+			if !b.expired(){
+				newBlocks = append(newBlocks, b)
+			}
+			if e.Name() == b.f.Name(){
+				isOpened = true
+				break
+			}
+		}
+		if isOpened{
+			continue
+		}
+		needAdded = append(needAdded, e)
+	}
+
+	for _,d := range needAdded{
+		block,err := openDiskPartition(d.Name(), db.retention)
+		if err != nil{
+			return fmt.Errorf("open diskpartition failed")
+		}
+		newBlocks = append(newBlocks, block)
+	}
+	db.blocks = append(db.blocks[0:], newBlocks...)
+	sort.Slice(db.blocks, func(i, j int) bool {
+		return db.blocks[i].minTimestamp() < db.blocks[j].minTimestamp()
+	})
+	return nil
+}
+

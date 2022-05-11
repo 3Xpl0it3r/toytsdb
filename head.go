@@ -1,7 +1,6 @@
 package toytsdb
 
 import (
-	"fmt"
 	"path"
 	"runtime"
 	"sort"
@@ -9,6 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+
+var _ Appender = new(MemPartition)
 
 type MemPartition struct {
 	metrics   sync.Map
@@ -27,7 +29,46 @@ type MemPartition struct {
 	labelIndex labelIndex
 }
 
+func (m *MemPartition) Add(labels Labels,timestamp int64, value float64) {
+
+	if  timestamp <= 0 ||atomic.LoadInt64(&m.minT) > timestamp{
+		// illegal value, drop it
+		return
+	}
+	m.once.Do(func() {
+		if timestamp < m.minTimestamp(){
+			atomic.StoreInt64(&m.minT, timestamp)
+		}
+	})
+
+	if err := m.wal.append(nil);err != nil{
+		return
+	}
+	ref := labels.Hash()
+	m.labelIndex.AddLabels(labels, ref)
+	mt := m.getMetric(ref)
+	// if timestamp is zero
+	mt.insertPoint(&Sample{Timestamp: timestamp, Value: value})
+	if atomic.LoadInt64(&m.maxT) < timestamp{
+		atomic.StoreInt64(&m.maxT, timestamp)
+	}
+}
+
+func (m *MemPartition) Commit() error {
+	panic("implement me")
+}
+
+func (m *MemPartition) Rollback() error {
+	panic("implement me")
+}
+
 type labelIndex map[Label][]uint64
+
+func(li labelIndex)AddLabels(ls Labels, ref uint64){
+	for _, label := range ls{
+		li.addLabel(label, ref)
+	}
+}
 
 func (li labelIndex) addLabel(l Label, ref uint64) {
 	refList, ok := li[l]
@@ -75,57 +116,6 @@ func newMemoryPartition(dbDir string, walBufSize int, partitionDuration time.Dur
 	return memPartition, nil
 }
 
-func (m *MemPartition) insertRows(rows []Row) ([]Row, error) {
-	if len(rows) == 0 {
-		return nil, fmt.Errorf("no rows given ")
-	}
-	if err := m.wal.append(rows); err != nil {
-		return nil, fmt.Errorf("failed to write to wal %w", err)
-	}
-
-	// Set min timestamp at only first
-	m.once.Do(func() {
-		min := rows[0].Timestamp
-		for i := range rows {
-			row := rows[i]
-			if row.Timestamp < min {
-				min = row.Timestamp
-			}
-		}
-		atomic.SwapInt64(&m.minT, min)
-	})
-	outdatedRows := make([]Row, 0)
-	maxTimestamp := rows[0].Timestamp
-	var rowsNum int64
-	for i := range rows {
-		row := rows[i]
-		if row.Timestamp < m.minTimestamp() {
-			outdatedRows = append(outdatedRows, row)
-			continue
-		}
-
-		if row.Timestamp == 0 {
-			row.Timestamp = toUnix(time.Now(), m.timestampPrecision)
-		}
-		if row.Timestamp > maxTimestamp {
-			m.maxT = row.Timestamp
-		}
-		ref := row.Labels.Hash()
-		mt := m.getMetric(ref)
-		for _, label := range row.Labels {
-			m.labelIndex.addLabel(label, ref)
-		}
-		mt.insertPoint(&row.Sample)
-		rowsNum++
-	}
-	atomic.AddInt64(&m.numPoints, rowsNum)
-
-	// Make max timestamp up-to-date
-	if atomic.LoadInt64(&m.maxT) < maxTimestamp {
-		atomic.SwapInt64(&m.maxT, maxTimestamp)
-	}
-	return outdatedRows, nil
-}
 
 func (m *MemPartition) selectDataPoints(labels Labels, start, end int64) ([]*Sample, error) {
 	mt := m.getMetric(labels.Hash())
@@ -148,17 +138,17 @@ func (m *MemPartition) active() bool {
 	return m.maxTimestamp()-m.minTimestamp()+1 < m.partitionDuration
 }
 
-func (m *MemPartition) getMetric(name uint64) *memoryMetric {
+func (m *MemPartition) getMetric(ref uint64) *memoryMetric {
 	// 使用并发map来实现， prometheues 里面采用了分片锁来提高并发行
 	// todo 更换成分片锁
-	value, ok := m.metrics.Load(name)
+	value, ok := m.metrics.Load(ref)
 	if !ok {
 		value = &memoryMetric{
-			name:             name,
+			name:             ref,
 			points:           make([]*Sample, 0, 1000),
 			outOfOrderPoints: make([]*Sample, 0),
 		}
-		m.metrics.Store(name, value)
+		m.metrics.Store(ref, value)
 	}
 	return value.(*memoryMetric)
 }
@@ -181,7 +171,6 @@ type memoryMetric struct {
 	points           []*Sample
 	outOfOrderPoints []*Sample
 	mu               sync.RWMutex
-	//labelIndex map[Label][]uint64
 }
 
 func (m *memoryMetric) insertPoint(point *Sample) {
