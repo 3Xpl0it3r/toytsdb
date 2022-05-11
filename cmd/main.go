@@ -25,6 +25,9 @@ func main() {
 		appender.Add(row.Labels, row.Timestamp, row.Value)
 	}
 
+	if err := s.Commit();err != nil{
+		panic(err)
+	}
 	labels := toytsdb.Labels{
 		{
 			Name: "__name__", Value: "metric1",

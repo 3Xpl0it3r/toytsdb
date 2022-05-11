@@ -2,6 +2,7 @@ package toytsdb
 
 import (
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"testing"
 	"time"
 )
@@ -25,7 +26,7 @@ func Test_memoryPartition_InsertRows(t *testing.T) {
 		{
 			name: "inset in-order rows",
 			memoryPartition: func() *MemPartition {
-				m, _ := newMemoryPartition("", 0, 0, "")
+				m, _ := newMemoryPartition("", nil, 0, "")
 
 				return m
 			}(),
@@ -38,43 +39,20 @@ func Test_memoryPartition_InsertRows(t *testing.T) {
 			},
 			wantOutOfOrderRows: []Row{},
 		},
-		{
-			name: "insert out-of-order rows",
-			memoryPartition: func() *MemPartition {
-				m, _ := newMemoryPartition("", 0, 0, "")
-				for _, row := range []Row{
-					{Labels: []Label{{Name: "__name__", Value: "metric1"}},
-						Sample: Sample{Timestamp: 3, Value: 0.1},
-					},
-				}{
-					m.Add(row.Labels, row.Timestamp, row.Value)
-				}
-				return m
-			}(),
-			rows: []Row{
-				{Labels: []Label{{Name: "__name__", Value: "metric1"}},
-					Sample: Sample{Timestamp: 1, Value: 0.1},
-				},
-			},
-			wantDatePoints: []*Sample{
-				{Timestamp: 3, Value: 0.1},
-			},
-			wantOutOfOrderRows: []Row{
-				{Labels: []Label{{Name: "__name__", Value: "metric1"}},
-					Sample: Sample{Timestamp: 1, Value: 0.1},
-				},
-			},
-		},
+		// does not support un-order samples any more
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			for _,row := range tt.rows{
-				tt.memoryPartition.Add(row.Labels, row.Timestamp, row.Value)
+				ref,err := tt.memoryPartition.Add(row.Labels, row.Timestamp, row.Value)
+				require.Equal(t,row.Labels.Hash(), ref)
+				require.NoError(t, err)
 			}
 
 			labels := Labels{
 				{Name: "__name__", Value: "metric1"},
 			}
+			require.NoError(t, tt.memoryPartition.Commit())
 
 			got, _ := tt.memoryPartition.selectDataPoints(labels, 0, 4)
 			assert.Equal(t, tt.wantDatePoints, got)
@@ -82,61 +60,7 @@ func Test_memoryPartition_InsertRows(t *testing.T) {
 	}
 }
 
-func Test_memoryPartition_SelectDataPoints(t *testing.T) {
-	tests := []struct {
-		name            string
-		labels          []Label
-		start           int64
-		end             int64
-		memoryPartition *MemPartition
-		want            []*Sample
-	}{
-		{
-			name:  "given non-exist metric name",
-			start: 1,
-			end:   2,
-			memoryPartition: func() *MemPartition {
-				m, _ := newMemoryPartition("", 0, 0, "")
-				return m
-			}(),
-			want: []*Sample{},
-		},
-		{
-			name:   "select multiple points",
-			labels: []Label{{Name: "__name__", Value: "metric1"}},
-			start:  0,
-			end:    4,
-			memoryPartition: func() *MemPartition {
-				m, _ := newMemoryPartition("", 0, 0, "")
-				for _, row := range []Row{
-					mockRow1, mockRow2, mockRow3,
-				}{
-					m.Add(row.Labels, row.Timestamp, row.Value)
-				}
 
-				return m
-			}(),
-			want: []*Sample{
-				{
-					Timestamp: 1, Value: 0.1,
-				},
-				{
-					Timestamp: 2, Value: 0.1,
-				},
-				{
-					Timestamp: 3, Value: 0.1,
-				},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, _ := tt.memoryPartition.selectDataPoints(tt.labels, tt.start, tt.end)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
 
 func Test_toUnix(t *testing.T) {
 	tests := []struct {

@@ -16,12 +16,17 @@ import (
 type RefSeries struct {
 	Ref    uint64
 	Labels []Label
+
+	series *memSeries
 }
 
 type RefSample struct {
 	Ref uint64
 	T   int64
 	V   float64
+
+	series *memSeries
+
 }
 
 // WAL is a write ahead log that is used to log series and log samples

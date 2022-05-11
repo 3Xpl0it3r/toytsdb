@@ -1,7 +1,7 @@
 package toytsdb
 
 import (
-	"path"
+	"fmt"
 	"runtime"
 	"sort"
 	"sync"
@@ -9,11 +9,21 @@ import (
 	"time"
 )
 
+const (
+	stripeSize = 1 << 14
+	stripeMask = stripeSize - 1
+
+	poolSize = 1 << 9
+)
 
 var _ Appender = new(MemPartition)
 
 type MemPartition struct {
-	metrics   sync.Map
+	series *stripeSeries
+
+	samplePool []RefSample
+	seriesPool []RefSeries
+
 	numPoints int64
 
 	minT int64
@@ -27,45 +37,94 @@ type MemPartition struct {
 	once               sync.Once
 
 	labelIndex labelIndex
+
+	mut sync.Mutex
 }
 
-func (m *MemPartition) Add(labels Labels,timestamp int64, value float64) {
+func newMemoryPartition(dbDir string, wal Wal, partitionDuration time.Duration, precision TimestampPrecision) (*MemPartition, error) {
+	memPartition := &MemPartition{
+		timestampPrecision: precision,
+		labelIndex:         map[Label][]uint64{},
+		series:             newStripeSeries(),
+		samplePool: make([]RefSample, 0, poolSize),
+		seriesPool: make([]RefSeries, 0, poolSize),
+	}
 
-	if  timestamp <= 0 ||atomic.LoadInt64(&m.minT) > timestamp{
+	if wal != nil {
+		memPartition.wal = &nopWal{}
+	} else {
+		memPartition.wal = wal
+	}
+
+	switch precision {
+	case Nanoseconds:
+		memPartition.partitionDuration = partitionDuration.Nanoseconds()
+	case Microseconds:
+		memPartition.partitionDuration = partitionDuration.Microseconds()
+	case Milliseconds:
+		memPartition.partitionDuration = partitionDuration.Milliseconds()
+	case Seconds:
+		memPartition.partitionDuration = int64(partitionDuration.Seconds())
+	default:
+		memPartition.partitionDuration = partitionDuration.Nanoseconds()
+	}
+	return memPartition, nil
+}
+
+
+// Add only add sample and series into buffer cache, for it is not committed
+// if committed, then the series and samples will be recorder into chunks and wal
+func (m *MemPartition) Add(labels Labels, timestamp int64, value float64) (uint64, error) {
+
+	if timestamp <= 0 || atomic.LoadInt64(&m.minT) > timestamp {
 		// illegal value, drop it
-		return
+		return 0, fmt.Errorf("sample timestamp is validate")
 	}
 	m.once.Do(func() {
-		if timestamp < m.minTimestamp(){
+		if timestamp < m.minTimestamp() {
 			atomic.StoreInt64(&m.minT, timestamp)
 		}
 	})
-
-	if err := m.wal.append(nil);err != nil{
-		return
-	}
 	ref := labels.Hash()
 	m.labelIndex.AddLabels(labels, ref)
-	mt := m.getMetric(ref)
-	// if timestamp is zero
-	mt.insertPoint(&Sample{Timestamp: timestamp, Value: value})
-	if atomic.LoadInt64(&m.maxT) < timestamp{
-		atomic.StoreInt64(&m.maxT, timestamp)
-	}
+
+	mt := m.getOrCreateSeries(ref)
+	m.samplePool = append(m.samplePool, RefSample{
+		Ref: ref,
+		T:   timestamp,
+		V:   value,
+		series: mt,
+	})
+	m.seriesPool = append(m.seriesPool, RefSeries{
+		Ref:    ref,
+		Labels: labels,
+		series: mt,
+	})
+	return ref, nil
 }
 
 func (m *MemPartition) Commit() error {
-	panic("implement me")
+	m.mut.Lock()
+	defer m.mut.Unlock()
+	for i,sample := range m.samplePool{
+		s := Sample{
+			Value:     sample.V,
+			Timestamp: sample.T,
+		}
+		m.samplePool[i].series.insertPoint(&s)
+	}
+	return nil
 }
 
-func (m *MemPartition) Rollback() error {
-	panic("implement me")
+func (m *MemPartition) Rollback()  {
+	m.seriesPool = m.seriesPool[0:]
+	m.samplePool = m.samplePool[0:]
 }
 
 type labelIndex map[Label][]uint64
 
-func(li labelIndex)AddLabels(ls Labels, ref uint64){
-	for _, label := range ls{
+func (li labelIndex) AddLabels(ls Labels, ref uint64) {
+	for _, label := range ls {
 		li.addLabel(label, ref)
 	}
 }
@@ -85,40 +144,9 @@ func (li labelIndex) addLabel(l Label, ref uint64) {
 	}
 }
 
-func newMemoryPartition(dbDir string, walBufSize int, partitionDuration time.Duration, precision TimestampPrecision) (*MemPartition, error) {
-	memPartition := &MemPartition{
-		timestampPrecision: precision,
-		labelIndex:         map[Label][]uint64{},
-	}
-
-	if walBufSize == 0 {
-		memPartition.wal = &nopWal{}
-	} else {
-		if wal, err := newDiskWAL(path.Join(dbDir, "wal"), walBufSize); err != nil {
-			return nil, err
-		} else {
-			memPartition.wal = wal
-		}
-	}
-
-	switch precision {
-	case Nanoseconds:
-		memPartition.partitionDuration = partitionDuration.Nanoseconds()
-	case Microseconds:
-		memPartition.partitionDuration = partitionDuration.Microseconds()
-	case Milliseconds:
-		memPartition.partitionDuration = partitionDuration.Milliseconds()
-	case Seconds:
-		memPartition.partitionDuration = int64(partitionDuration.Seconds())
-	default:
-		memPartition.partitionDuration = partitionDuration.Nanoseconds()
-	}
-	return memPartition, nil
-}
-
 
 func (m *MemPartition) selectDataPoints(labels Labels, start, end int64) ([]*Sample, error) {
-	mt := m.getMetric(labels.Hash())
+	mt := m.getOrCreateSeries(labels.Hash())
 	return mt.selectPoints(start, end), nil
 }
 
@@ -138,19 +166,26 @@ func (m *MemPartition) active() bool {
 	return m.maxTimestamp()-m.minTimestamp()+1 < m.partitionDuration
 }
 
-func (m *MemPartition) getMetric(ref uint64) *memoryMetric {
-	// 使用并发map来实现， prometheues 里面采用了分片锁来提高并发行
-	// todo 更换成分片锁
-	value, ok := m.metrics.Load(ref)
+func (m *MemPartition) getOrCreateSeries(ref uint64) *memSeries {
+	// 使用并发map来实现， prometheus 里面采用了分片锁来提高并发行
+	m.series.locks[ref&stripeMask].Lock()
+	defer m.series.locks[ref&stripeMask].Unlock()
+	ms, ok := m.series.series[ref&stripeMask][ref]
 	if !ok {
-		value = &memoryMetric{
-			name:             ref,
-			points:           make([]*Sample, 0, 1000),
-			outOfOrderPoints: make([]*Sample, 0),
-		}
-		m.metrics.Store(ref, value)
+		ms = newMemSeries(ref)
+		m.series.series[ref&stripeMask][ref] = ms
 	}
-	return value.(*memoryMetric)
+	return ms
+}
+
+func(m *MemPartition)getSeries(ref uint64)(*memSeries, error){
+	m.series.locks[ref & stripeMask].Lock()
+	defer m.series.locks[ref &stripeMask].Unlock()
+	ms, ok := m.series.series[ref &stripeMask][ref]
+	if !ok {
+		return nil, fmt.Errorf("no data found")
+	}
+	return ms, nil
 }
 
 func (m *MemPartition) clean() error {
@@ -162,21 +197,26 @@ func (m *MemPartition) expired() bool {
 	return false
 }
 
-type memoryMetric struct {
-	name         uint64
+type memSeries struct {
+	sync.Mutex
+	ref          uint64
 	size         int64
 	minTimestamp int64
 	maxTimestamp int64
 
-	points           []*Sample
-	outOfOrderPoints []*Sample
-	mu               sync.RWMutex
+	points []*Sample
 }
 
-func (m *memoryMetric) insertPoint(point *Sample) {
+func newMemSeries(ref uint64) *memSeries {
+	return &memSeries{
+		ref:    ref,
+		points: make([]*Sample, 0, 1000),
+	}
+}
+
+// insertPoints is coroutine safety, so caller should not be lock it before call it
+func (m *memSeries) insertPoint(point *Sample) {
 	size := atomic.LoadInt64(&m.size)
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if size == 0 {
 		m.points = append(m.points, point)
@@ -193,10 +233,9 @@ func (m *memoryMetric) insertPoint(point *Sample) {
 		atomic.AddInt64(&m.size, 1)
 		return
 	}
-	m.outOfOrderPoints = append(m.outOfOrderPoints, point)
 }
 
-func (m *memoryMetric) selectPoints(start, end int64) []*Sample {
+func (m *memSeries) selectPoints(start, end int64) []*Sample {
 	size := atomic.LoadInt64(&m.size)
 	minTimestamp := atomic.LoadInt64(&m.minTimestamp)
 	maxTimestamp := atomic.LoadInt64(&m.maxTimestamp)
@@ -205,8 +244,8 @@ func (m *memoryMetric) selectPoints(start, end int64) []*Sample {
 		return []*Sample{}
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.Lock()
+	defer m.Unlock()
 	if start <= minTimestamp {
 		startIdx = 0
 	} else {
@@ -240,37 +279,36 @@ func toUnix(t time.Time, precision TimestampPrecision) int64 {
 	}
 }
 
-func (m *memoryMetric) encodeAllDataPoints(encoder *XORChunk) error {
+func (m *memSeries) encodeAllDataPoints(encoder *XORChunk) error {
 	// merge sort
-	sort.Slice(m.outOfOrderPoints, func(i, j int) bool {
-		return m.outOfOrderPoints[i].Timestamp < m.outOfOrderPoints[j].Timestamp
-	})
-	var oi, pi int
-	var point *Sample
-	for oi < len(m.outOfOrderPoints) && pi < len(m.points) {
-		if m.outOfOrderPoints[oi].Timestamp < m.points[pi].Timestamp {
-			point = m.outOfOrderPoints[oi]
-			oi++
-		} else {
-			point = m.points[pi]
-			pi++
-		}
-		if err := encoder.Append(point.Timestamp, point.Value); err != nil {
-			return err
-		}
-	}
-	for ; oi < len(m.outOfOrderPoints); oi++ {
-		point = m.outOfOrderPoints[oi]
-		if err := encoder.Append(point.Timestamp, point.Value); err != nil {
-			return err
-		}
-
-	}
-	for ; pi < len(m.points); pi++ {
-		point = m.points[pi]
-		if err := encoder.Append(point.Timestamp, point.Value); err != nil {
+	for i := 0; i < len(m.points); i++ {
+		if err := encoder.Append(m.points[i].Timestamp, m.points[i].Value); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// stripeSeries 用来实现分片锁来降低锁的粒度
+type stripeSeries struct {
+	locks  [stripeSize]stripeLock
+	series [stripeSize]map[uint64]*memSeries
+}
+
+type stripeLock struct {
+	sync.RWMutex
+	_ [40]byte
+}
+
+func newStripeSeries() *stripeSeries {
+	ss := stripeSeries{
+		locks:  [stripeSize]stripeLock{},
+		series: [stripeSize]map[uint64]*memSeries{},
+	}
+	for i := 0; i< stripeSize; i++{
+		ss.locks[i] = stripeLock{}
+		ss.series[i] = map[uint64]*memSeries{}
+	}
+	return &ss
+}
+

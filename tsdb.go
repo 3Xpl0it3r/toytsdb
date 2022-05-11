@@ -1,10 +1,8 @@
 package toytsdb
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -38,11 +36,11 @@ const (
 
 type Appender interface {
 	// Add timestamp and value into appender
-	Add(Labels ,int64,  float64)
-	// Commit submit the collected samples
+	Add(Labels ,int64,  float64)(uint64, error)
+	// Commit  只有被commit的日志才会被记录进去，没有被commit的可以通过rollback直接回滚
 	Commit()error
 	// Rollback rolls all modifications into memory partition
-	Rollback()error
+	Rollback()
 }
 
 type Row struct {
@@ -106,12 +104,20 @@ func OpenTSDB(dir string, opts ...Option) (*TSDB, error) {
 
 	// write ahead log
 	walDir := filepath.Join(db.dataPath, "wal")
+	if db.walBufferedSize <= 0 {
+		db.walBufferedSize = defaultWALBufferSize
+	}
+
+	wal,err := newDiskWAL(walDir, db.walBufferedSize)
+	if err != nil {
+		return nil, fmt.Errorf("open wal failed: %v", err)
+	}
 
 	if err := db.reloadBlock();err != nil{
 		return nil, err
 	}
 
-	if head, err := newMemoryPartition(db.dataPath, db.walBufferedSize, db.partitionDuration, db.timestampPrecision); err != nil {
+	if head, err := newMemoryPartition(db.dataPath,wal, db.partitionDuration, db.timestampPrecision); err != nil {
 		return nil, err
 	} else {
 		db.head = head
@@ -163,98 +169,107 @@ func (db *TSDB) Select(labels Labels, start, end int64) ([]*Sample, error) {
 	return points, nil
 }
 
+func(db *TSDB)Commit()error{
+	return db.Appender().Commit()
+}
+
+
+func(db *TSDB)Rollback(){
+	db.Appender().Rollback()
+}
+
 func (db *TSDB) Close() error {
 	// todo
 	db.wg.Wait()
 
-	if err := db.flushPartitions(); err != nil {
-		return fmt.Errorf("failed to close TSDB : %w", err)
-	}
+	//if err := db.flushPartitions(); err != nil {
+	//	return fmt.Errorf("failed to close TSDB : %w", err)
+	//}
 	db.removeExpiredPartitions()
 	return nil
 }
 
 // flushPartitions persists all in-memory partitions ready to persisted
 // For the in-memory mode, just removes it from the partition list
-func (db *TSDB) flushPartitions() error {
+//func (db *TSDB) flushPartitions() error {
+//
+//	dir := filepath.Join(db.dataPath, fmt.Sprintf("b-%d-%d", db.head.minTimestamp(), db.head.maxTimestamp()))
+//	if err := db.flush(dir); err != nil {
+//		return fmt.Errorf("failed to compact memory parition into %s: %w", dir, err)
+//	}
+//
+//	return nil
+//}
 
-	dir := filepath.Join(db.dataPath, fmt.Sprintf("b-%d-%d", db.head.minTimestamp(), db.head.maxTimestamp()))
-	if err := db.flush(dir); err != nil {
-		return fmt.Errorf("failed to compact memory parition into %s: %w", dir, err)
-	}
-
-	return nil
-}
-
-// flush compacts the data points in the give partition and flushes them to the given directory
-func (db *TSDB) flush(dirPath string) error {
-	if dirPath == "" {
-		return fmt.Errorf("dir path is requierd ")
-	}
-	if err := os.MkdirAll(dirPath, fs.ModePerm); err != nil {
-		return fmt.Errorf("failed to make directory %q: %w", dirPath, err)
-	}
-	f, err := os.Create(filepath.Join(dirPath, dataFileName))
-	if err != nil {
-		return fmt.Errorf("failed to create faile %q: %w", dirPath, err)
-	}
-	defer f.Close()
-
-	encoder := NewXorChunk(f)
-	metrics := map[uint64]diskMetric{}
-	db.head.metrics.Range(func(key, value interface{}) bool {
-		mt, ok := value.(*memoryMetric)
-		if !ok {
-			fmt.Printf("unknown value found\n")
-			return false
-		}
-		offset, err := f.Seek(io.SeekStart, 1)
-		if err != nil {
-			fmt.Printf("failed to set file offset of metric %q: %v\n", mt.name, err)
-			return false
-		}
-
-		// Compress data points for each metric
-		if err := mt.encodeAllDataPoints(encoder); err != nil {
-			return false
-		}
-
-		metrics[mt.name] = diskMetric{
-			Name:          mt.name,
-			Offset:        offset,
-			MinTimestamp:  mt.minTimestamp,
-			MaxTimestamp:  mt.maxTimestamp,
-			NumDataPoints: mt.size + int64(len(mt.outOfOrderPoints)),
-		}
-		return true
-	})
-
-	if err := encoder.flush(); err != nil {
-		return err
-	}
-
-	b, err := json.Marshal(&BlockMeta{
-		MinTimestamp:  db.head.minTimestamp(),
-		MaxTimestamp:  db.head.maxTimestamp(),
-		NumDataPoints: db.head.size(),
-		Metrics:       metrics,
-		CreateAt:      time.Now(),
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to encode metadata: %w", err)
-	}
-	metaPath := filepath.Join(dirPath, metaFileName)
-	if err := os.WriteFile(metaPath, b, fs.ModePerm); err != nil {
-		return fmt.Errorf("failed to write metadata to %s: %w", metaPath, err)
-	}
-	if block, err := openDiskPartition(dirPath, db.retention); err != nil {
-		fmt.Printf("open DiskPartition failed ;%v", err)
-	} else {
-		db.blocks = append(db.blocks, block)
-	}
-	return nil
-}
+//// flush compacts the data points in the give partition and flushes them to the given directory
+//func (db *TSDB) flush(dirPath string) error {
+//	if dirPath == "" {
+//		return fmt.Errorf("dir path is requierd ")
+//	}
+//	if err := os.MkdirAll(dirPath, fs.ModePerm); err != nil {
+//		return fmt.Errorf("failed to make directory %q: %w", dirPath, err)
+//	}
+//	f, err := os.Create(filepath.Join(dirPath, dataFileName))
+//	if err != nil {
+//		return fmt.Errorf("failed to create faile %q: %w", dirPath, err)
+//	}
+//	defer f.Close()
+//
+//	encoder := NewXorChunk(f)
+//	metrics := map[uint64]diskMetric{}
+//	db.head.metrics.Range(func(key, value interface{}) bool {
+//		mt, ok := value.(*memoryMetric)
+//		if !ok {
+//			fmt.Printf("unknown value found\n")
+//			return false
+//		}
+//		offset, err := f.Seek(io.SeekStart, 1)
+//		if err != nil {
+//			fmt.Printf("failed to set file offset of metric %q: %v\n", mt.name, err)
+//			return false
+//		}
+//
+//		// Compress data points for each metric
+//		if err := mt.encodeAllDataPoints(encoder); err != nil {
+//			return false
+//		}
+//
+//		metrics[mt.name] = diskMetric{
+//			Name:          mt.name,
+//			Offset:        offset,
+//			MinTimestamp:  mt.minTimestamp,
+//			MaxTimestamp:  mt.maxTimestamp,
+//			NumDataPoints: mt.size + int64(len(mt.outOfOrderPoints)),
+//		}
+//		return true
+//	})
+//
+//	if err := encoder.flush(); err != nil {
+//		return err
+//	}
+//
+//	b, err := json.Marshal(&BlockMeta{
+//		MinTimestamp:  db.head.minTimestamp(),
+//		MaxTimestamp:  db.head.maxTimestamp(),
+//		NumDataPoints: db.head.size(),
+//		Metrics:       metrics,
+//		CreateAt:      time.Now(),
+//	})
+//
+//	if err != nil {
+//		return fmt.Errorf("failed to encode metadata: %w", err)
+//	}
+//	metaPath := filepath.Join(dirPath, metaFileName)
+//	if err := os.WriteFile(metaPath, b, fs.ModePerm); err != nil {
+//		return fmt.Errorf("failed to write metadata to %s: %w", metaPath, err)
+//	}
+//	if block, err := openDiskPartition(dirPath, db.retention); err != nil {
+//		fmt.Printf("open DiskPartition failed ;%v", err)
+//	} else {
+//		db.blocks = append(db.blocks, block)
+//	}
+//	return nil
+//}
 
 func (db *TSDB) removeExpiredPartitions() {
 	for index, block := range db.blocks {
@@ -299,6 +314,8 @@ func (db *TSDB) run() {
 
 func (db *TSDB)Compact(){
 	// todo compact
+	// compact persistent memory diskpartition into disk
+	// relist diskpartition
 }
 
 //

@@ -7,7 +7,7 @@ import (
 )
 
 func Test_storage_Select(t *testing.T) {
-	head, err := newMemoryPartition("padata", 0, 1*time.Hour, Seconds)
+	head, err := newMemoryPartition("padata", nil, 1*time.Hour, Seconds)
 	require.NoError(t, err)
 	rows := []Row{
 		{Labels: []Label{{Name: "__name__", Value: "metric1"}}, Sample: Sample{Timestamp: 1, Value: 10}},
@@ -20,6 +20,7 @@ func Test_storage_Select(t *testing.T) {
 	require.NoError(t, err)
 
 	db := TSDB{blocks: []*DiskPartition{}, head: head, workerLimitCh: make(chan struct{})}
+	require.NoError(t, db.Commit())
 
 	got, err := db.Select([]Label{{Name: "__name__", Value: "metric1"}}, 0, 4)
 	require.NoError(t, err)
